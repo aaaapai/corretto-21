@@ -31,6 +31,7 @@
 #include "gc/shared/accessBarrierSupport.inline.hpp"
 #include "gc/shared/cardTable.hpp"
 #include "gc/shenandoah/shenandoahAsserts.hpp"
+#include "gc/shenandoah/shenandoahCardTable.hpp"
 #include "gc/shenandoah/shenandoahCollectionSet.inline.hpp"
 #include "gc/shenandoah/shenandoahEvacOOMHandler.inline.hpp"
 #include "gc/shenandoah/shenandoahForwarding.inline.hpp"
@@ -188,7 +189,7 @@ inline void ShenandoahBarrierSet::keep_alive_if_weak(DecoratorSet decorators, oo
 
 template <DecoratorSet decorators, typename T>
 inline void ShenandoahBarrierSet::write_ref_field_post(T* field) {
-  assert(ShenandoahCardBarrier, "Did you mean to enable ShenandoahCardBarrier?");
+  assert(ShenandoahCardBarrier, "Should have been checked by caller");
   volatile CardTable::CardValue* byte = card_table()->byte_for(field);
   *byte = CardTable::dirty_card_val();
 }
@@ -257,10 +258,9 @@ template <DecoratorSet decorators, typename BarrierSetT>
 template <typename T>
 inline void ShenandoahBarrierSet::AccessBarrier<decorators, BarrierSetT>::oop_store_common(T* addr, oop value) {
   shenandoah_assert_marked_if(nullptr, value,
-                              !CompressedOops::is_null(value) &&
-                              ShenandoahHeap::heap()->is_evacuation_in_progress() &&
-                              !(ShenandoahHeap::heap()->active_generation()->is_young() &&
-                              ShenandoahHeap::heap()->heap_region_containing(value)->is_old()));
+                              !CompressedOops::is_null(value) && ShenandoahHeap::heap()->is_evacuation_in_progress()
+                              && !(ShenandoahHeap::heap()->active_generation()->is_young()
+                                   && ShenandoahHeap::heap()->heap_region_containing(value)->is_old()));
   shenandoah_assert_not_in_cset_if(addr, value, value != nullptr && !ShenandoahHeap::heap()->cancelled_gc());
   ShenandoahBarrierSet* const bs = ShenandoahBarrierSet::barrier_set();
   bs->iu_barrier(value);
@@ -434,7 +434,6 @@ void ShenandoahBarrierSet::arraycopy_barrier(T* src, T* dst, size_t count) {
 
   if (_heap->mode()->is_generational()) {
     assert(ShenandoahSATBBarrier, "Generational mode assumes SATB mode");
-    // TODO: Could we optimize here by checking that dst is in an old region?
     if ((gc_state & ShenandoahHeap::OLD_MARKING) != 0) {
       // Note that we can't do the arraycopy marking using the 'src' array when
       // SATB mode is enabled (so we can't do this as part of the iteration for

@@ -42,27 +42,14 @@ ShenandoahYoungHeuristics::ShenandoahYoungHeuristics(ShenandoahYoungGeneration* 
 void ShenandoahYoungHeuristics::choose_collection_set_from_regiondata(ShenandoahCollectionSet* cset,
                                                                       RegionData* data, size_t size,
                                                                       size_t actual_free) {
-  // The logic for cset selection in adaptive is as follows:
+  // See comments in ShenandoahAdaptiveHeuristics::choose_collection_set_from_regiondata():
+  // we do the same here, but with the following adjustments for generational mode:
   //
-  //   1. We cannot get cset larger than available free space. Otherwise we guarantee OOME
-  //      during evacuation, and thus guarantee full GC. In practice, we also want to let
-  //      application to allocate something. This is why we limit CSet to some fraction of
-  //      available space. In non-overloaded heap, max_cset would contain all plausible candidates
-  //      over garbage threshold.
-  //
-  //   2. We should not get cset too low so that free threshold would not be met right
-  //      after the cycle. Otherwise we get back-to-back cycles for no reason if heap is
-  //      too fragmented. In non-overloaded non-fragmented heap min_garbage would be around zero.
-  //
-  // Therefore, we start by sorting the regions by garbage. Then we unconditionally add the best candidates
-  // before we meet min_garbage. Then we add all candidates that fit with a garbage threshold before
-  // we hit max_cset. When max_cset is hit, we terminate the cset selection. Note that in this scheme,
-  // ShenandoahGarbageThreshold is the soft threshold which would be ignored until min_garbage is hit.
-
-  // In generational mode, the sort order within the data array is not strictly descending amounts of garbage.  In
-  // particular, regions that have reached tenure age will be sorted into this array before younger regions that contain
-  // more garbage.  This represents one of the reasons why we keep looking at regions even after we decide, for example,
-  // to exclude one of the regions because it might require evacuation of too much live data.
+  // In generational mode, the sort order within the data array is not strictly descending amounts
+  // of garbage. In particular, regions that have reached tenure age will be sorted into this
+  // array before younger regions that typically contain more garbage. This is one reason why,
+  // for example, we continue examining regions even after rejecting a region that has
+  // more live data than we can evacuate.
 
   // Better select garbage-first regions
   QuickSort::sort<RegionData>(data, (int) size, compare_by_garbage, false);
@@ -100,7 +87,7 @@ void ShenandoahYoungHeuristics::choose_young_collection_set(ShenandoahCollection
           byte_size_in_proper_unit(actual_free), proper_unit_for_byte_size(actual_free));
 
   for (size_t idx = 0; idx < size; idx++) {
-    ShenandoahHeapRegion* r = data[idx]._region;
+    ShenandoahHeapRegion* r = data[idx].get_region();
     if (cset->is_preselected(r->index())) {
       continue;
     }
@@ -209,15 +196,6 @@ size_t ShenandoahYoungHeuristics::bytes_of_allocation_runway_before_gc_trigger(s
   // but evac_slack_spiking is only relevant if is_spiking, as defined below.
 
   double avg_cycle_time = _gc_cycle_time_history->davg() + (_margin_of_error_sd * _gc_cycle_time_history->dsd());
-
-  // TODO: Consider making conservative adjustments to avg_cycle_time, such as: (avg_cycle_time *= 2) in cases where
-  // we expect a longer-than-normal GC duration.  This includes mixed evacuations, evacuation that perform promotion
-  // including promotion in place, and OLD GC bootstrap cycles.  It has been observed that these cycles sometimes
-  // require twice or more the duration of "normal" GC cycles.  We have experimented with this approach.  While it
-  // does appear to reduce the frequency of degenerated cycles due to late triggers, it also has the effect of reducing
-  // evacuation slack so that there is less memory available to be transferred to OLD.  The result is that we
-  // throttle promotion and it takes too long to move old objects out of the young generation.
-
   double avg_alloc_rate = _allocation_rate.upper_bound(_margin_of_error_sd);
   size_t evac_slack_avg;
   if (anticipated_available > avg_cycle_time * avg_alloc_rate + penalties + spike_headroom) {

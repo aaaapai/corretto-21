@@ -1,6 +1,5 @@
 /*
  * Copyright (c) 2018, 2019, Red Hat, Inc. All rights reserved.
- * Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -90,7 +89,7 @@ void ShenandoahCompactHeuristics::choose_collection_set_from_regiondata(Shenando
 
   size_t live_cset = 0;
   for (size_t idx = 0; idx < size; idx++) {
-    ShenandoahHeapRegion* r = data[idx]._region;
+    ShenandoahHeapRegion* r = data[idx].get_region();
     size_t new_cset = live_cset + r->get_live_data_bytes();
     if (new_cset < max_cset && r->garbage() > threshold) {
       live_cset = new_cset;

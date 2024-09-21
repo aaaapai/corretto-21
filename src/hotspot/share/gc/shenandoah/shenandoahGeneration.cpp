@@ -43,19 +43,15 @@
 
 
 class ShenandoahResetUpdateRegionStateClosure : public ShenandoahHeapRegionClosure {
- private:
+private:
   ShenandoahHeap* _heap;
   ShenandoahMarkingContext* const _ctx;
- public:
+public:
   ShenandoahResetUpdateRegionStateClosure() :
     _heap(ShenandoahHeap::heap()),
     _ctx(_heap->marking_context()) {}
 
   void heap_region_do(ShenandoahHeapRegion* r) override {
-    if (_heap->is_bitmap_slice_committed(r)) {
-      _ctx->clear_bitmap(r);
-    }
-
     if (r->is_active()) {
       // Reset live data and set TAMS optimistically. We would recheck these under the pause
       // anyway to capture any updates that happened since now.
@@ -67,31 +63,35 @@ class ShenandoahResetUpdateRegionStateClosure : public ShenandoahHeapRegionClosu
   bool is_thread_safe() override { return true; }
 };
 
-class ShenandoahResetBitmapTask : public ShenandoahHeapRegionClosure {
- private:
-  ShenandoahHeap* _heap;
-  ShenandoahMarkingContext* const _ctx;
- public:
-  ShenandoahResetBitmapTask() :
-    _heap(ShenandoahHeap::heap()),
-    _ctx(_heap->marking_context()) {}
+class ShenandoahResetBitmapTask : public WorkerTask {
+private:
+  ShenandoahRegionIterator _regions;
+  ShenandoahGeneration* _generation;
 
-  void heap_region_do(ShenandoahHeapRegion* region) {
-    if (_heap->is_bitmap_slice_committed(region)) {
-      _ctx->clear_bitmap(region);
+public:
+  ShenandoahResetBitmapTask(ShenandoahGeneration* generation) :
+    WorkerTask("Shenandoah Reset Bitmap"), _generation(generation) {}
+
+  void work(uint worker_id) {
+    ShenandoahHeapRegion* region = _regions.next();
+    ShenandoahHeap* heap = ShenandoahHeap::heap();
+    ShenandoahMarkingContext* const ctx = heap->marking_context();
+    while (region != nullptr) {
+      if (_generation->contains(region) && heap->is_bitmap_slice_committed(region)) {
+        ctx->clear_bitmap(region);
+      }
+      region = _regions.next();
     }
   }
-
-  bool is_thread_safe() { return true; }
 };
 
 // Copy the write-version of the card-table into the read-version, clearing the
 // write-copy.
 class ShenandoahMergeWriteTable: public ShenandoahHeapRegionClosure {
- private:
-  RememberedScanner* _scanner;
- public:
-  ShenandoahMergeWriteTable(RememberedScanner* scanner) : _scanner(scanner) {}
+private:
+  ShenandoahScanRemembered* _scanner;
+public:
+  ShenandoahMergeWriteTable(ShenandoahScanRemembered* scanner) : _scanner(scanner) {}
 
   void heap_region_do(ShenandoahHeapRegion* r) override {
     assert(r->is_old(), "Don't waste time doing this for non-old regions");
@@ -104,10 +104,10 @@ class ShenandoahMergeWriteTable: public ShenandoahHeapRegionClosure {
 };
 
 class ShenandoahCopyWriteCardTableToRead: public ShenandoahHeapRegionClosure {
- private:
-  RememberedScanner* _scanner;
- public:
-  ShenandoahCopyWriteCardTableToRead(RememberedScanner* scanner) : _scanner(scanner) {}
+private:
+  ShenandoahScanRemembered* _scanner;
+public:
+  ShenandoahCopyWriteCardTableToRead(ShenandoahScanRemembered* scanner) : _scanner(scanner) {}
 
   void heap_region_do(ShenandoahHeapRegion* region) override {
     assert(region->is_old(), "Don't waste time doing this for non-old regions");
@@ -193,8 +193,8 @@ void ShenandoahGeneration::reset_mark_bitmap() {
 
   set_mark_incomplete();
 
-  ShenandoahResetBitmapTask task;
-  parallel_heap_region_iterate(&task);
+  ShenandoahResetBitmapTask task(this);
+  heap->workers()->run_task(&task);
 }
 
 // The ideal is to swap the remembered set so the safepoint effort is no more than a few pointer manipulations.
@@ -207,7 +207,6 @@ void ShenandoahGeneration::swap_remembered_set() {
   heap->assert_gc_workers(heap->workers()->active_workers());
   shenandoah_assert_safepoint();
 
-  // TODO: Eventually, we want to replace this with a constant-time exchange of pointers.
   ShenandoahOldGeneration* old_generation = heap->old_generation();
   ShenandoahCopyWriteCardTableToRead task(old_generation->card_scan());
   old_generation->parallel_heap_region_iterate(&task);
@@ -228,8 +227,8 @@ void ShenandoahGeneration::merge_write_table() {
 }
 
 void ShenandoahGeneration::prepare_gc() {
-  // Invalidate the marking context
-  set_mark_incomplete();
+
+  reset_mark_bitmap();
 
   // Capture Top At Mark Start for this generation (typically young) and reset mark bitmap.
   ShenandoahResetUpdateRegionStateClosure cl;
@@ -599,11 +598,6 @@ size_t ShenandoahGeneration::select_aged_regions(size_t old_available) {
       // these regions.  The likely outcome is that these regions will not be selected for evacuation or promotion
       // in the current cycle and we will anticipate that they will be promoted in the next cycle.  This will cause
       // us to reserve more old-gen memory so that these objects can be promoted in the subsequent cycle.
-      //
-      // TODO:
-      //   If we are auto-tuning the tenure age and regions that were anticipated to be promoted in place end up
-      //   being promoted by evacuation, this event should feed into the tenure-age-selection heuristic so that
-      //   the tenure age can be increased.
       if (heap->is_aging_cycle() && (r->age() + 1 == tenuring_threshold)) {
         if (r->garbage() >= old_garbage_threshold) {
           promo_potential += r->get_live_data_bytes();
@@ -705,14 +699,6 @@ void ShenandoahGeneration::prepare_regions_and_collection_set(bool concurrent) {
       // preselected regions, which are removed when we exit this scope.
       ResourceMark rm;
       ShenandoahCollectionSetPreselector preselector(collection_set, heap->num_regions());
-
-      // TODO: young_available can include available (between top() and end()) within each young region that is not
-      // part of the collection set.  Making this memory available to the young_evacuation_reserve allows a larger
-      // young collection set to be chosen when available memory is under extreme pressure.  Implementing this "improvement"
-      // is tricky, because the incremental construction of the collection set actually changes the amount of memory
-      // available to hold evacuated young-gen objects.  As currently implemented, the memory that is available within
-      // non-empty regions that are not selected as part of the collection set can be allocated by the mutator while
-      // GC is evacuating and updating references.
 
       // Find the amount that will be promoted, regions that will be promoted in
       // place, and preselect older regions that will be promoted by evacuation.
@@ -850,14 +836,14 @@ void ShenandoahGeneration::scan_remembered_set(bool is_concurrent) {
   heap->assert_gc_workers(nworkers);
   heap->workers()->run_task(&task);
   if (ShenandoahEnableCardStats) {
-    RememberedScanner* scanner = heap->old_generation()->card_scan();
+    ShenandoahScanRemembered* scanner = heap->old_generation()->card_scan();
     assert(scanner != nullptr, "Not generational");
     scanner->log_card_stats(nworkers, CARD_STAT_SCAN_RS);
   }
 }
 
 size_t ShenandoahGeneration::increment_affiliated_region_count() {
-  shenandoah_assert_heaplocked_or_fullgc_safepoint();
+  shenandoah_assert_heaplocked_or_safepoint();
   // During full gc, multiple GC worker threads may change region affiliations without a lock.  No lock is enforced
   // on read and write of _affiliated_region_count.  At the end of full gc, a single thread overwrites the count with
   // a coherent value.
@@ -866,31 +852,29 @@ size_t ShenandoahGeneration::increment_affiliated_region_count() {
 }
 
 size_t ShenandoahGeneration::decrement_affiliated_region_count() {
-  shenandoah_assert_heaplocked_or_fullgc_safepoint();
+  shenandoah_assert_heaplocked_or_safepoint();
   // During full gc, multiple GC worker threads may change region affiliations without a lock.  No lock is enforced
   // on read and write of _affiliated_region_count.  At the end of full gc, a single thread overwrites the count with
   // a coherent value.
   _affiliated_region_count--;
-  // TODO: REMOVE IS_GLOBAL() QUALIFIER AFTER WE FIX GLOBAL AFFILIATED REGION ACCOUNTING
-  assert(is_global() || ShenandoahHeap::heap()->is_full_gc_in_progress() ||
+  assert(ShenandoahHeap::heap()->is_full_gc_in_progress() ||
          (_used + _humongous_waste <= _affiliated_region_count * ShenandoahHeapRegion::region_size_bytes()),
          "used + humongous cannot exceed regions");
   return _affiliated_region_count;
 }
 
 size_t ShenandoahGeneration::increase_affiliated_region_count(size_t delta) {
-  shenandoah_assert_heaplocked_or_fullgc_safepoint();
+  shenandoah_assert_heaplocked_or_safepoint();
   _affiliated_region_count += delta;
   return _affiliated_region_count;
 }
 
 size_t ShenandoahGeneration::decrease_affiliated_region_count(size_t delta) {
-  shenandoah_assert_heaplocked_or_fullgc_safepoint();
+  shenandoah_assert_heaplocked_or_safepoint();
   assert(_affiliated_region_count >= delta, "Affiliated region count cannot be negative");
 
   _affiliated_region_count -= delta;
-  // TODO: REMOVE IS_GLOBAL() QUALIFIER AFTER WE FIX GLOBAL AFFILIATED REGION ACCOUNTING
-  assert(is_global() || ShenandoahHeap::heap()->is_full_gc_in_progress() ||
+  assert(ShenandoahHeap::heap()->is_full_gc_in_progress() ||
          (_used + _humongous_waste <= _affiliated_region_count * ShenandoahHeapRegion::region_size_bytes()),
          "used + humongous cannot exceed regions");
   return _affiliated_region_count;
@@ -922,8 +906,7 @@ void ShenandoahGeneration::decrease_humongous_waste(size_t bytes) {
 }
 
 void ShenandoahGeneration::decrease_used(size_t bytes) {
-  // TODO: REMOVE IS_GLOBAL() QUALIFIER AFTER WE FIX GLOBAL AFFILIATED REGION ACCOUNTING
-  assert(is_global() || ShenandoahHeap::heap()->is_full_gc_in_progress() ||
+  assert(ShenandoahHeap::heap()->is_full_gc_in_progress() ||
          (_used >= bytes), "cannot reduce bytes used by generation below zero");
   Atomic::sub(&_used, bytes);
 }
@@ -970,15 +953,13 @@ size_t ShenandoahGeneration::increase_capacity(size_t increment) {
   // We do not enforce that new capacity >= heap->max_size_for(this).  The maximum generation size is treated as a rule of thumb
   // which may be violated during certain transitions, such as when we are forcing transfers for the purpose of promoting regions
   // in place.
-  // TODO: REMOVE IS_GLOBAL() QUALIFIER AFTER WE FIX GLOBAL AFFILIATED REGION ACCOUNTING
-  assert(is_global() || ShenandoahHeap::heap()->is_full_gc_in_progress() ||
+  assert(ShenandoahHeap::heap()->is_full_gc_in_progress() ||
          (_max_capacity + increment <= ShenandoahHeap::heap()->max_capacity()), "Generation cannot be larger than heap size");
   assert(increment % ShenandoahHeapRegion::region_size_bytes() == 0, "Generation capacity must be multiple of region size");
   _max_capacity += increment;
 
   // This detects arithmetic wraparound on _used
-  // TODO: REMOVE IS_GLOBAL() QUALIFIER AFTER WE FIX GLOBAL AFFILIATED REGION ACCOUNTING
-  assert(is_global() || ShenandoahHeap::heap()->is_full_gc_in_progress() ||
+  assert(ShenandoahHeap::heap()->is_full_gc_in_progress() ||
          (_affiliated_region_count * ShenandoahHeapRegion::region_size_bytes() >= _used),
          "Affiliated regions must hold more than what is currently used");
   return _max_capacity;
@@ -1002,15 +983,12 @@ size_t ShenandoahGeneration::decrease_capacity(size_t decrement) {
   _max_capacity -= decrement;
 
   // This detects arithmetic wraparound on _used
-  // TODO: REMOVE IS_GLOBAL() QUALIFIER AFTER WE FIX GLOBAL AFFILIATED REGION ACCOUNTING
-  assert(is_global() || ShenandoahHeap::heap()->is_full_gc_in_progress() ||
+  assert(ShenandoahHeap::heap()->is_full_gc_in_progress() ||
          (_affiliated_region_count * ShenandoahHeapRegion::region_size_bytes() >= _used),
          "Affiliated regions must hold more than what is currently used");
-  // TODO: REMOVE IS_GLOBAL() QUALIFIER AFTER WE FIX GLOBAL AFFILIATED REGION ACCOUNTING
-  assert(is_global() || ShenandoahHeap::heap()->is_full_gc_in_progress() ||
+  assert(ShenandoahHeap::heap()->is_full_gc_in_progress() ||
          (_used <= _max_capacity), "Cannot use more than capacity");
-  // TODO: REMOVE IS_GLOBAL() QUALIFIER AFTER WE FIX GLOBAL AFFILIATED REGION ACCOUNTING
-  assert(is_global() || ShenandoahHeap::heap()->is_full_gc_in_progress() ||
+  assert(ShenandoahHeap::heap()->is_full_gc_in_progress() ||
          (_affiliated_region_count * ShenandoahHeapRegion::region_size_bytes() <= _max_capacity),
          "Cannot use more than capacity");
   return _max_capacity;

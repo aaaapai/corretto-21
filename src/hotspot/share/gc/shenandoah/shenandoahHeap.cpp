@@ -388,7 +388,6 @@ jint ShenandoahHeap::initialize() {
   {
     ShenandoahHeapLocker locker(lock());
 
-
     for (size_t i = 0; i < _num_regions; i++) {
       HeapWord* start = (HeapWord*)sh_rs.base() + ShenandoahHeapRegion::region_size_words() * i;
       bool is_committed = i < num_committed_regions;
@@ -1003,8 +1002,6 @@ HeapWord* ShenandoahHeap::allocate_memory(ShenandoahAllocRequest& req) {
       // Stop retrying and return nullptr to cause OOMError exception if our allocation failed even after:
       //   a) We experienced a GC that had good progress, or
       //   b) We experienced at least one Full GC (whether or not it had good progress)
-      //
-      // TODO: Consider GLOBAL GC rather than Full GC to remediate OOM condition: https://bugs.openjdk.org/browse/JDK-8335910
 
       size_t original_count = shenandoah_policy()->full_gc_count();
       while ((result == nullptr) && (original_count == shenandoah_policy()->full_gc_count())) {
@@ -1015,7 +1012,7 @@ HeapWord* ShenandoahHeap::allocate_memory(ShenandoahAllocRequest& req) {
         // If our allocation request has been satisifed after it initially failed, we count this as good gc progress
         notify_gc_progress();
       }
-      if (log_is_enabled(Debug, gc, alloc)) {
+      if (log_develop_is_enabled(Debug, gc, alloc)) {
         ResourceMark rm;
         log_debug(gc, alloc)("Thread: %s, Result: " PTR_FORMAT ", Request: %s, Size: " SIZE_FORMAT
                              ", Original: " SIZE_FORMAT ", Latest: " SIZE_FORMAT,
@@ -1260,7 +1257,6 @@ oop ShenandoahHeap::try_evacuate_object(oop p, Thread* thread, ShenandoahHeapReg
       if ((copy == nullptr) && (size < ShenandoahThreadLocalData::gclab_size(thread))) {
         // GCLAB allocation failed because we are bumping up against the limit on young evacuation reserve.  Try resetting
         // the desired GCLAB size and retry GCLAB allocation to avoid cascading of shared memory allocations.
-        // TODO: is this right? using PLAB::min_size() here for gc lab size?
         ShenandoahThreadLocalData::set_gclab_size(thread, PLAB::min_size());
         copy = allocate_from_gclab(thread, size);
         // If we still get nullptr, we'll try a shared allocation below.
@@ -1932,7 +1928,7 @@ void ShenandoahHeap::recycle_trash() {
 void ShenandoahHeap::do_class_unloading() {
   _unloader.unload();
   if (mode()->is_generational()) {
-    old_generation()->set_parseable(false);
+    old_generation()->set_parsable(false);
   }
 }
 
@@ -2487,7 +2483,7 @@ void ShenandoahHeap::rebuild_free_set(bool concurrent) {
   if (mode()->is_generational()) {
     ShenandoahGenerationalHeap* gen_heap = ShenandoahGenerationalHeap::heap();
     ShenandoahOldGeneration* old_gen = gen_heap->old_generation();
-    old_gen->heuristics()->trigger_maybe(first_old_region, last_old_region, old_region_count, num_regions());
+    old_gen->heuristics()->evaluate_triggers(first_old_region, last_old_region, old_region_count, num_regions());
   }
 }
 

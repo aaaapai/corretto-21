@@ -22,20 +22,21 @@
  *
  */
 
-#ifndef SHARE_GC_SHENANDOAH_HEURISTICS_SHENANDOAHHEAPCHARACTERISTICS_HPP
-#define SHARE_GC_SHENANDOAH_HEURISTICS_SHENANDOAHHEAPCHARACTERISTICS_HPP
+#ifndef SHARE_GC_SHENANDOAH_SHENANDOAHTRACE_HPP
+#define SHARE_GC_SHENANDOAH_SHENANDOAHTRACE_HPP
 
-#include "utilities/globalDefinitions.hpp"
+#include "gc/shared/gcTrace.hpp"
+#include "memory/allocation.hpp"
 
-class ShenandoahHeapStats {
+class ShenandoahEvacInfo;
+
+class ShenandoahTracer : public GCTracer, public CHeapObj<mtGC> {
 public:
-  virtual const char* name() const = 0;
-  virtual size_t soft_max_capacity() const = 0;
-  virtual size_t max_capacity() const = 0;
-  virtual size_t used() const = 0;
-  virtual size_t available() const = 0;
-  virtual size_t soft_available() const = 0;
-  virtual size_t bytes_allocated_since_gc_start() const = 0;
+  ShenandoahTracer() : GCTracer(Shenandoah) {}
+  void report_evacuation_info(ShenandoahEvacInfo* info);
+
+private:
+  void send_evacuation_info_event(ShenandoahEvacInfo* info);
 };
 
-#endif //SHARE_GC_SHENANDOAH_HEURISTICS_SHENANDOAHHEAPCHARACTERISTICS_HPP
+#endif

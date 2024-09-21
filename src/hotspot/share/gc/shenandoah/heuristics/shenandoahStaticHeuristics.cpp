@@ -1,6 +1,5 @@
 /*
  * Copyright (c) 2018, 2019, Red Hat, Inc. All rights reserved.
- * Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -67,7 +66,7 @@ void ShenandoahStaticHeuristics::choose_collection_set_from_regiondata(Shenandoa
   size_t threshold = ShenandoahHeapRegion::region_size_bytes() * ShenandoahGarbageThreshold / 100;
 
   for (size_t idx = 0; idx < size; idx++) {
-    ShenandoahHeapRegion* r = data[idx]._region;
+    ShenandoahHeapRegion* r = data[idx].get_region();
     if (r->garbage() > threshold) {
       cset->add_region(r);
     }

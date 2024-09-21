@@ -421,7 +421,7 @@ void ShenandoahAsserts::assert_heaplocked_or_safepoint(const char* file, int lin
     return;
   }
 
-  if (ShenandoahSafepoint::is_at_shenandoah_safepoint() && Thread::current()->is_VM_thread()) {
+  if (ShenandoahSafepoint::is_at_shenandoah_safepoint()) {
     return;
   }
 
@@ -429,19 +429,47 @@ void ShenandoahAsserts::assert_heaplocked_or_safepoint(const char* file, int lin
   report_vm_error(file, line, msg.buffer());
 }
 
-// Unlike assert_heaplocked_or_safepoint(), this does not require current thread in safepoint to be a VM thread
-// TODO: This should be more aptly named. Nothing in this method checks we are actually in Full GC.
-void ShenandoahAsserts::assert_heaplocked_or_fullgc_safepoint(const char* file, int line) {
+void ShenandoahAsserts::assert_generational(const char* file, int line) {
+  if (ShenandoahHeap::heap()->mode()->is_generational()) {
+    return;
+  }
+
+  ShenandoahMessageBuffer msg("Must be in generational mode");
+  report_vm_error(file, line, msg.buffer());
+}
+
+void ShenandoahAsserts::assert_control_or_vm_thread_at_safepoint(bool at_safepoint, const char* file, int line) {
+  Thread* thr = Thread::current();
+  if (thr == ShenandoahHeap::heap()->control_thread()) {
+    return;
+  }
+  if (thr->is_VM_thread()) {
+    if (!at_safepoint) {
+      return;
+    } else if (SafepointSynchronize::is_at_safepoint()) {
+      return;
+    }
+  }
+
+  ShenandoahMessageBuffer msg("Must be either control thread, or vm thread");
+  if (at_safepoint) {
+    msg.append(" at a safepoint");
+  }
+  report_vm_error(file, line, msg.buffer());
+}
+
+void ShenandoahAsserts::assert_generations_reconciled(const char* file, int line) {
+  if (!SafepointSynchronize::is_at_safepoint()) {
+    return;
+  }
+
   ShenandoahHeap* heap = ShenandoahHeap::heap();
-
-  if (heap->lock()->owned_by_self()) {
+  ShenandoahGeneration* ggen = heap->gc_generation();
+  ShenandoahGeneration* agen = heap->active_generation();
+  if (agen == ggen) {
     return;
   }
 
-  if (ShenandoahSafepoint::is_at_shenandoah_safepoint()) {
-    return;
-  }
-
-  ShenandoahMessageBuffer msg("Heap lock must be owned by current thread, or be at safepoint");
+  ShenandoahMessageBuffer msg("Active(%d) & GC(%d) Generations aren't reconciled", agen->type(), ggen->type());
   report_vm_error(file, line, msg.buffer());
 }
