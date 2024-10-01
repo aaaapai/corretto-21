@@ -54,25 +54,25 @@ static const char* partition_name(ShenandoahFreeSetPartitionId t) {
 
 #ifndef PRODUCT
 void ShenandoahRegionPartitions::dump_bitmap() const {
-  log_info(gc)("Mutator range [" SSIZE_FORMAT ", " SSIZE_FORMAT "], Collector range [" SSIZE_FORMAT ", " SSIZE_FORMAT
-               "], Old Collector range [" SSIZE_FORMAT ", " SSIZE_FORMAT "]",
-               _leftmosts[int(ShenandoahFreeSetPartitionId::Mutator)],
-               _rightmosts[int(ShenandoahFreeSetPartitionId::Mutator)],
-               _leftmosts[int(ShenandoahFreeSetPartitionId::Collector)],
-               _rightmosts[int(ShenandoahFreeSetPartitionId::Collector)],
-               _leftmosts[int(ShenandoahFreeSetPartitionId::OldCollector)],
-               _rightmosts[int(ShenandoahFreeSetPartitionId::OldCollector)]);
-  log_info(gc)("Empty Mutator range [" SSIZE_FORMAT ", " SSIZE_FORMAT
-               "], Empty Collector range [" SSIZE_FORMAT ", " SSIZE_FORMAT
-               "], Empty Old Collecto range [" SSIZE_FORMAT ", " SSIZE_FORMAT "]",
-               _leftmosts_empty[int(ShenandoahFreeSetPartitionId::Mutator)],
-               _rightmosts_empty[int(ShenandoahFreeSetPartitionId::Mutator)],
-               _leftmosts_empty[int(ShenandoahFreeSetPartitionId::Collector)],
-               _rightmosts_empty[int(ShenandoahFreeSetPartitionId::Collector)],
-               _leftmosts_empty[int(ShenandoahFreeSetPartitionId::OldCollector)],
-               _rightmosts_empty[int(ShenandoahFreeSetPartitionId::OldCollector)]);
+  log_debug(gc)("Mutator range [" SSIZE_FORMAT ", " SSIZE_FORMAT "], Collector range [" SSIZE_FORMAT ", " SSIZE_FORMAT
+                "], Old Collector range [" SSIZE_FORMAT ", " SSIZE_FORMAT "]",
+                _leftmosts[int(ShenandoahFreeSetPartitionId::Mutator)],
+                _rightmosts[int(ShenandoahFreeSetPartitionId::Mutator)],
+                _leftmosts[int(ShenandoahFreeSetPartitionId::Collector)],
+                _rightmosts[int(ShenandoahFreeSetPartitionId::Collector)],
+                _leftmosts[int(ShenandoahFreeSetPartitionId::OldCollector)],
+                _rightmosts[int(ShenandoahFreeSetPartitionId::OldCollector)]);
+  log_debug(gc)("Empty Mutator range [" SSIZE_FORMAT ", " SSIZE_FORMAT
+                "], Empty Collector range [" SSIZE_FORMAT ", " SSIZE_FORMAT
+                "], Empty Old Collecto range [" SSIZE_FORMAT ", " SSIZE_FORMAT "]",
+                _leftmosts_empty[int(ShenandoahFreeSetPartitionId::Mutator)],
+                _rightmosts_empty[int(ShenandoahFreeSetPartitionId::Mutator)],
+                _leftmosts_empty[int(ShenandoahFreeSetPartitionId::Collector)],
+                _rightmosts_empty[int(ShenandoahFreeSetPartitionId::Collector)],
+                _leftmosts_empty[int(ShenandoahFreeSetPartitionId::OldCollector)],
+                _rightmosts_empty[int(ShenandoahFreeSetPartitionId::OldCollector)]);
 
-  log_info(gc)("%6s: %18s %18s %18s %18s", "index", "Mutator Bits", "Collector Bits", "Old Collector Bits", "NotFree Bits");
+  log_debug(gc)("%6s: %18s %18s %18s %18s", "index", "Mutator Bits", "Collector Bits", "Old Collector Bits", "NotFree Bits");
   dump_bitmap_range(0, _max-1);
 }
 
@@ -96,8 +96,8 @@ void ShenandoahRegionPartitions::dump_bitmap_row(idx_t region_idx) const {
   uintx old_collector_bits = _membership[int(ShenandoahFreeSetPartitionId::OldCollector)].bits_at(aligned_idx);
   uintx free_bits = mutator_bits | collector_bits | old_collector_bits;
   uintx notfree_bits =  ~free_bits;
-  log_info(gc)(SSIZE_FORMAT_W(6) ": " SIZE_FORMAT_X_0 " 0x" SIZE_FORMAT_X_0 " 0x" SIZE_FORMAT_X_0 " 0x" SIZE_FORMAT_X_0,
-               aligned_idx, mutator_bits, collector_bits, old_collector_bits, notfree_bits);
+  log_debug(gc)(SSIZE_FORMAT_W(6) ": " SIZE_FORMAT_X_0 " 0x" SIZE_FORMAT_X_0 " 0x" SIZE_FORMAT_X_0 " 0x" SIZE_FORMAT_X_0,
+                aligned_idx, mutator_bits, collector_bits, old_collector_bits, notfree_bits);
 }
 #endif
 
@@ -669,6 +669,7 @@ void ShenandoahRegionPartitions::assert_bounds() {
 ShenandoahFreeSet::ShenandoahFreeSet(ShenandoahHeap* heap, size_t max_regions) :
   _heap(heap),
   _partitions(max_regions, this),
+  _trash_regions(NEW_C_HEAP_ARRAY(ShenandoahHeapRegion*, max_regions, mtGC)),
   _alloc_bias_weight(0)
 {
   clear_internal();
@@ -1217,7 +1218,7 @@ HeapWord* ShenandoahFreeSet::allocate_contiguous(ShenandoahAllocRequest& req) {
   return _heap->get_region(beg)->bottom();
 }
 
-void ShenandoahFreeSet::try_recycle_trashed(ShenandoahHeapRegion *r) {
+void ShenandoahFreeSet::try_recycle_trashed(ShenandoahHeapRegion* r) {
   if (r->is_trash()) {
     r->recycle();
   }
@@ -1226,13 +1227,24 @@ void ShenandoahFreeSet::try_recycle_trashed(ShenandoahHeapRegion *r) {
 void ShenandoahFreeSet::recycle_trash() {
   // lock is not reentrable, check we don't have it
   shenandoah_assert_not_heaplocked();
+  size_t count = 0;
   for (size_t i = 0; i < _heap->num_regions(); i++) {
     ShenandoahHeapRegion* r = _heap->get_region(i);
     if (r->is_trash()) {
-      ShenandoahHeapLocker locker(_heap->lock());
-      try_recycle_trashed(r);
+      _trash_regions[count++] = r;
     }
-    SpinPause(); // allow allocators to take the lock
+  }
+
+  // Relinquish the lock after this much time passed.
+  static constexpr jlong deadline_ns = 30000; // 30 us
+  size_t idx = 0;
+  while (idx < count) {
+    os::naked_yield(); // Yield to allow allocators to take the lock
+    ShenandoahHeapLocker locker(_heap->lock());
+    const jlong deadline = os::javaTimeNanos() + deadline_ns;
+    while (idx < count && os::javaTimeNanos() < deadline) {
+      try_recycle_trashed(_trash_regions[idx++]);
+    }
   }
 }
 
@@ -1495,7 +1507,7 @@ void ShenandoahFreeSet::move_regions_from_collector_to_mutator(size_t max_xfer_r
   }
 
   size_t total_xfer = collector_xfer + old_collector_xfer;
-  log_info(gc, free)("At start of update refs, moving " SIZE_FORMAT "%s to Mutator free set from Collector Reserve ("
+  log_info(gc, ergo)("At start of update refs, moving " SIZE_FORMAT "%s to Mutator free set from Collector Reserve ("
                      SIZE_FORMAT "%s) and from Old Collector Reserve (" SIZE_FORMAT "%s)",
                      byte_size_in_proper_unit(total_xfer), proper_unit_for_byte_size(total_xfer),
                      byte_size_in_proper_unit(collector_xfer), proper_unit_for_byte_size(collector_xfer),

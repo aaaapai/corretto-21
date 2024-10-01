@@ -760,7 +760,7 @@ void ShenandoahHeap::notify_mutator_alloc_words(size_t words, size_t waste) {
   if (ShenandoahPacing) {
     control_thread()->pacing_notify_alloc(words);
     if (waste > 0) {
-      pacer()->claim_for_alloc(waste, true);
+      pacer()->claim_for_alloc<true>(waste);
     }
   }
 }
@@ -1211,14 +1211,8 @@ private:
 };
 
 void ShenandoahHeap::evacuate_collection_set(bool concurrent) {
-  if (mode()->is_generational()) {
-    ShenandoahRegionIterator regions;
-    ShenandoahGenerationalEvacuationTask task(ShenandoahGenerationalHeap::heap(), &regions, concurrent);
-    workers()->run_task(&task);
-  } else {
-    ShenandoahEvacuationTask task(this, _collection_set, concurrent);
-    workers()->run_task(&task);
-  }
+  ShenandoahEvacuationTask task(this, _collection_set, concurrent);
+  workers()->run_task(&task);
 }
 
 oop ShenandoahHeap::evacuate_object(oop p, Thread* thread) {
@@ -1871,19 +1865,20 @@ class ShenandoahParallelHeapRegionTask : public WorkerTask {
 private:
   ShenandoahHeap* const _heap;
   ShenandoahHeapRegionClosure* const _blk;
+  size_t const _stride;
 
   shenandoah_padding(0);
   volatile size_t _index;
   shenandoah_padding(1);
 
 public:
-  ShenandoahParallelHeapRegionTask(ShenandoahHeapRegionClosure* blk) :
+  ShenandoahParallelHeapRegionTask(ShenandoahHeapRegionClosure* blk, size_t stride) :
           WorkerTask("Shenandoah Parallel Region Operation"),
-          _heap(ShenandoahHeap::heap()), _blk(blk), _index(0) {}
+          _heap(ShenandoahHeap::heap()), _blk(blk), _stride(stride), _index(0) {}
 
   void work(uint worker_id) {
     ShenandoahParallelWorkerSession worker_session(worker_id);
-    size_t stride = ShenandoahParallelRegionStride;
+    size_t stride = _stride;
 
     size_t max = _heap->num_regions();
     while (Atomic::load(&_index) < max) {
@@ -1902,8 +1897,20 @@ public:
 
 void ShenandoahHeap::parallel_heap_region_iterate(ShenandoahHeapRegionClosure* blk) const {
   assert(blk->is_thread_safe(), "Only thread-safe closures here");
-  if (num_regions() > ShenandoahParallelRegionStride) {
-    ShenandoahParallelHeapRegionTask task(blk);
+  const uint active_workers = workers()->active_workers();
+  const size_t n_regions = num_regions();
+  size_t stride = ShenandoahParallelRegionStride;
+  if (stride == 0 && active_workers > 1) {
+    // Automatically derive the stride to balance the work between threads
+    // evenly. Do not try to split work if below the reasonable threshold.
+    constexpr size_t threshold = 4096;
+    stride = n_regions <= threshold ?
+            threshold :
+            (n_regions + active_workers - 1) / active_workers;
+  }
+
+  if (n_regions > stride && active_workers > 1) {
+    ShenandoahParallelHeapRegionTask task(blk, stride);
     workers()->run_task(&task);
   } else {
     heap_region_iterate(blk);
