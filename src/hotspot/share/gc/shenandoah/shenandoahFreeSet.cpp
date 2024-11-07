@@ -2032,21 +2032,17 @@ void ShenandoahFreeSet::print_on(outputStream* out) const {
 double ShenandoahFreeSet::internal_fragmentation() {
   double squared = 0;
   double linear = 0;
-  int count = 0;
 
-  idx_t rightmost = _partitions.rightmost(ShenandoahFreeSetPartitionId::Mutator);
-  for (idx_t index = _partitions.leftmost(ShenandoahFreeSetPartitionId::Mutator); index <= rightmost; ) {
-    assert(_partitions.in_free_set(ShenandoahFreeSetPartitionId::Mutator, index),
-           "Boundaries or find_first_set_bit failed: " SSIZE_FORMAT, index);
-    ShenandoahHeapRegion* r = _heap->get_region(index);
-    size_t used = r->used();
-    squared += used * used;
-    linear += used;
-    count++;
-    index = _partitions.find_index_of_next_available_region(ShenandoahFreeSetPartitionId::Mutator, index + 1);
+  for (size_t index = _mutator_leftmost; index <= _mutator_rightmost; index++) {
+    if (is_mutator_free(index)) {
+      ShenandoahHeapRegion* r = _heap->get_region(index);
+      size_t used = r->used();
+      squared += used * used;
+      linear += used;
+    }
   }
 
-  if (count > 0) {
+  if (linear > 0) {
     double s = squared / (ShenandoahHeapRegion::region_size_bytes() * linear);
     return 1 - s;
   } else {
