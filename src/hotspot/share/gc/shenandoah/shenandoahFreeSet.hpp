@@ -309,14 +309,14 @@ private:
   // While holding the heap lock, allocate memory for a single object or LAB  which is to be entirely contained
   // within a single HeapRegion as characterized by req.
   //
-  // Precondition: req.size() <= ShenandoahHeapRegion::humongous_threshold_words().
+  // Precondition: !ShenandoahHeapRegion::requires_humongous(req.size())
   HeapWord* allocate_single(ShenandoahAllocRequest& req, bool& in_new_region);
 
   // While holding the heap lock, allocate memory for a humongous object which spans one or more regions that
   // were previously empty.  Regions that represent humongous objects are entirely dedicated to the humongous
   // object.  No other objects are packed into these regions.
   //
-  // Precondition: req.size() > ShenandoahHeapRegion::humongous_threshold_words().
+  // Precondition: ShenandoahHeapRegion::requires_humongous(req.size())
   HeapWord* allocate_contiguous(ShenandoahAllocRequest& req);
 
   // Change region r from the Mutator partition to the GC's Collector or OldCollector partition.  This requires that the
@@ -353,6 +353,9 @@ private:
   // Set max_capacity for young and old generations
   void establish_generation_sizes(size_t young_region_count, size_t old_region_count);
   size_t get_usable_free_words(size_t free_bytes) const;
+
+  // log status, assuming lock has already been acquired by the caller.
+  void log_status();
 
 public:
   ShenandoahFreeSet(ShenandoahHeap* heap, size_t max_regions);
@@ -408,7 +411,8 @@ public:
 
   void recycle_trash();
 
-  void log_status();
+  // Acquire heap lock and log status, assuming heap lock is not acquired by the caller.
+  void log_status_under_lock();
 
   inline size_t capacity()  const { return _partitions.capacity_of(ShenandoahFreeSetPartitionId::Mutator); }
   inline size_t used()      const { return _partitions.used_by(ShenandoahFreeSetPartitionId::Mutator);     }
