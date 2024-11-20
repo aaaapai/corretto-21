@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -21,13 +21,22 @@
  * questions.
  */
 
-/**
- * @test
- * @bug 8072452 8163498
- * @library /test/lib
- * @summary Support DHE sizes up to 8192-bits and DSA sizes up to 3072-bits
- *          This test has been split based on lower/higher key sizes in order to
- *          reduce individual execution times and run in parallel
- *          (see SupportedDHParamGens.java)
- * @run main/timeout=700 SupportedDHParamGens 3072
- */
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Path;
+
+public class ChildProcessAppLauncher {
+    public static void main(String[] args) throws IOException, InterruptedException {
+        if (args.length == 1 && "noexit".equals(args[0])) {
+            var lock = new Object();
+            synchronized (lock) {
+                lock.wait();
+            }
+        } else {
+            var childPath = System.getProperty("jpackage.app-path"); // get the path to the current jpackage app launcher
+            ProcessBuilder processBuilder = new ProcessBuilder(childPath, "noexit"); //ChildProcessAppLauncher acts as third party app
+            Process process = processBuilder.start();
+            System.out.println("Child id=" + process.pid());
+        }
+    }
+}
