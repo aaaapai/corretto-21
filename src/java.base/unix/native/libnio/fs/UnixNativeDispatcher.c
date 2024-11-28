@@ -79,11 +79,13 @@
 // by defining binary compatible statx structs in this file and
 // not relying on included headers.
 
+#ifndef __BIONIC__
 #ifndef __GLIBC__
 // Alpine doesn't know these types, define them
 typedef unsigned int       __uint32_t;
 typedef unsigned short     __uint16_t;
 typedef unsigned long int  __uint64_t;
+#endif
 #endif
 
 /*
