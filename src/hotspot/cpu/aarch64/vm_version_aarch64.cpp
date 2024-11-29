@@ -253,8 +253,10 @@ void VM_Version::initialize() {
     FLAG_SET_DEFAULT(UseCRC32, false);
   }
 
-  // Neoverse V1
-  if (_cpu == CPU_ARM && (_model == 0xd40 || _model2 == 0xd40)) {
+  // Neoverse
+  //   V1: 0xd40
+  //   V2: 0xd4f
+  if (_cpu == CPU_ARM && (model_is(0xd40) || model_is(0xd4f))) {
     if (FLAG_IS_DEFAULT(UseCryptoPmullForCRC32)) {
       FLAG_SET_DEFAULT(UseCryptoPmullForCRC32, true);
     }
