@@ -40,6 +40,7 @@
 #include "memory/allStatic.hpp"
 #include "memory/memRegion.hpp"
 #include "memory/resourceArea.hpp"
+#include "oops/compressedKlass.inline.hpp"
 #include "oops/instanceKlass.hpp"
 #include "oops/objArrayKlass.hpp"
 #include "oops/objArrayOop.inline.hpp"
@@ -215,8 +216,10 @@ bool ArchiveBuilder::gather_klass_and_symbol(MetaspaceClosure::Ref* ref, bool re
     if (!is_excluded(klass)) {
       _klasses->append(klass);
     }
-    // See RunTimeClassInfo::get_for()
-    _estimated_metaspaceobj_bytes += align_up(BytesPerWord, SharedSpaceObjectAlignment);
+    // See RunTimeClassInfo::get_for(): make sure we have enough space for both maximum
+    // Klass alignment as well as the RuntimeInfo* pointer we will embed in front of a Klass.
+    _estimated_metaspaceobj_bytes += align_up(BytesPerWord, CompressedKlassPointers::klass_alignment_in_bytes()) +
+        align_up(sizeof(void*), SharedSpaceObjectAlignment);
   } else if (ref->msotype() == MetaspaceObj::SymbolType) {
     // Make sure the symbol won't be GC'ed while we are dumping the archive.
     Symbol* sym = (Symbol*)ref->obj();
@@ -594,7 +597,7 @@ void ArchiveBuilder::make_shallow_copy(DumpRegion *dump_region, SourceObjInfo* s
 
   oldtop = dump_region->top();
   if (src_info->msotype() == MetaspaceObj::ClassType) {
-    // Save a pointer immediate in front of an InstanceKlass, so
+    // Allocate space for a pointer directly in front of the future InstanceKlass, so
     // we can do a quick lookup from InstanceKlass* -> RunTimeClassInfo*
     // without building another hashtable. See RunTimeClassInfo::get_for()
     // in systemDictionaryShared.cpp.
@@ -603,8 +606,19 @@ void ArchiveBuilder::make_shallow_copy(DumpRegion *dump_region, SourceObjInfo* s
       SystemDictionaryShared::validate_before_archiving(InstanceKlass::cast(klass));
       dump_region->allocate(sizeof(address));
     }
+    // Allocate space for the future InstanceKlass with proper alignment
+    const size_t alignment =
+#ifdef _LP64
+      UseCompressedClassPointers ?
+        nth_bit(ArchiveBuilder::precomputed_narrow_klass_shift()) :
+        SharedSpaceObjectAlignment;
+#else
+      SharedSpaceObjectAlignment;
+#endif
+    dest = dump_region->allocate(bytes, alignment);
+  } else {
+    dest = dump_region->allocate(bytes);
   }
-  dest = dump_region->allocate(bytes);
   newtop = dump_region->top();
 
   memcpy(dest, src, bytes);
@@ -627,6 +641,8 @@ void ArchiveBuilder::make_shallow_copy(DumpRegion *dump_region, SourceObjInfo* s
   src_info->set_buffered_addr((address)dest);
 
   _alloc_stats.record(src_info->msotype(), int(newtop - oldtop), src_info->read_only());
+
+  DEBUG_ONLY(_alloc_stats.verify((int)dump_region->used(), src_info->read_only()));
 }
 
 // This is used by code that hand-assemble data structures, such as the LambdaProxyClassKey, that are
@@ -686,6 +702,15 @@ void ArchiveBuilder::make_klasses_shareable() {
     const char* generated = "";
     Klass* k = get_buffered_addr(klasses()->at(i));
     k->remove_java_mirror();
+#ifdef _LP64
+    if (UseCompactObjectHeaders) {
+      Klass* requested_k = to_requested(k);
+      address narrow_klass_base = _requested_static_archive_bottom; // runtime encoding base == runtime mapping start
+      const int narrow_klass_shift = ArchiveBuilder::precomputed_narrow_klass_shift();
+      narrowKlass nk = CompressedKlassPointers::encode_not_null_without_asserts(requested_k, narrow_klass_base, narrow_klass_shift);
+      k->set_prototype_header(markWord::prototype().set_narrow_klass(nk));
+    }
+#endif //_LP64
     if (k->is_objArray_klass()) {
       // InstanceKlass and TypeArrayKlass will in turn call remove_unshareable_info
       // on their array classes.
@@ -774,12 +799,22 @@ uintx ArchiveBuilder::any_to_offset(address p) const {
   return buffer_to_offset(p);
 }
 
+#if INCLUDE_CDS_JAVA_HEAP
 narrowKlass ArchiveBuilder::get_requested_narrow_klass(Klass* k) {
   assert(DumpSharedSpaces, "sanity");
   k = get_buffered_klass(k);
   Klass* requested_k = to_requested(k);
-  return CompressedKlassPointers::encode_not_null(requested_k, _requested_static_archive_bottom);
+  const int narrow_klass_shift = ArchiveBuilder::precomputed_narrow_klass_shift();
+#ifdef ASSERT
+  const size_t klass_alignment = MAX2(SharedSpaceObjectAlignment, (size_t)nth_bit(narrow_klass_shift));
+  assert(is_aligned(k, klass_alignment), "Klass " PTR_FORMAT " misaligned.", p2i(k));
+#endif
+  address narrow_klass_base = _requested_static_archive_bottom; // runtime encoding base == runtime mapping start
+  // Note: use the "raw" version of encode that takes explicit narrow klass base and shift. Don't use any
+  // of the variants that do sanity checks, nor any of those that use the current - dump - JVM's encoding setting.
+  return CompressedKlassPointers::encode_not_null_without_asserts(requested_k, narrow_klass_base, narrow_klass_shift);
 }
+#endif // INCLUDE_CDS_JAVA_HEAP
 
 // RelocateBufferToRequested --- Relocate all the pointers in rw/ro,
 // so that the archive can be mapped to the "requested" location without runtime relocation.
@@ -857,6 +892,20 @@ class RelocateBufferToRequested : public BitMapClosure {
   }
 };
 
+#ifdef _LP64
+int ArchiveBuilder::precomputed_narrow_klass_shift() {
+  // Legacy Mode:
+  //    We use 32 bits for narrowKlass, which should cover the full 4G Klass range. Shift can be 0.
+  // CompactObjectHeader Mode:
+  //    narrowKlass is much smaller, and we use the highest possible shift value to later get the maximum
+  //    Klass encoding range.
+  //
+  // Note that all of this may change in the future, if we decide to correct the pre-calculated
+  // narrow Klass IDs at archive load time.
+  assert(UseCompressedClassPointers, "Only needed for compressed class pointers");
+  return UseCompactObjectHeaders ?  CompressedKlassPointers::max_shift() : 0;
+}
+#endif // _LP64
 
 void ArchiveBuilder::relocate_to_requested() {
   ro_region()->pack();
@@ -1007,7 +1056,9 @@ class ArchiveBuilder::CDSMapLogger : AllStatic {
         ResourceMark rm;
         log_info(cds, map)(PTR_FORMAT ": @@ Object %s",
                            p2i(to_requested(start)), original_oop->klass()->external_name());
-        byte_size = original_oop->size() * BytesPerWord;
+	size_t old_size = original_oop->size();
+        size_t new_size = original_oop->copy_size(old_size, original_oop->mark());
+        byte_size = new_size * BytesPerWord;
       } else if (start == ArchiveHeapWriter::buffered_heap_roots_addr()) {
         // HeapShared::roots() is copied specially so it doesn't exist in
         // HeapShared::OriginalObjectTable. See HeapShared::copy_roots().

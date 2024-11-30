@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1997, 2021, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1997, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -25,6 +25,7 @@
 #ifndef SHARE_OOPS_MARKWORD_HPP
 #define SHARE_OOPS_MARKWORD_HPP
 
+#include "gc/shared/gc_globals.hpp"
 #include "metaprogramming/primitiveConversions.hpp"
 #include "oops/oopsHierarchy.hpp"
 #include "runtime/globals.hpp"
@@ -39,14 +40,37 @@
 //  --------
 //             hash:25 ------------>| age:4  unused_gap:1  lock:2 (normal object)
 //
+//  32 bits (with compact headers):
+//  -------------------------------
+//             unused:23 ------------>| hashctrl:2  age:4  unused_gap:1  lock:2 (normal object)
+//
 //  64 bits:
 //  --------
 //  unused:25 hash:31 -->| unused_gap:1  age:4  unused_gap:1  lock:2 (normal object)
+//
+//  64 bits (with compact headers):
+//  -------------------------------
+//  nklass:32 unused_gap:19 hash:2 unused_gap:4  age:4  self-fwded:1  lock:2 (normal object)
 //
 //  - hash contains the identity hash value: largest value is
 //    31 bits, see os::random().  Also, 64-bit vm's require
 //    a hash value no bigger than 32 bits because they will not
 //    properly generate a mask larger than that: see library_call.cpp
+//
+//  - With +UseCompactObjectHeaders:
+//    hashctrl bits indicate if object has been hashed:
+//    00 - never hashed
+//    01 - hashed, but not moved by GC: will recompute hash
+//    10 - hashed and moved by GC, and hashcode has been installed in appended field
+//
+//    The first 2 combinations will trigger a slow-path call:
+//    00 - set the hashctrl bits to 01, and compute the identity hash
+//    01 - recompute idendity hash. When GC encounters 01 when moving an object, it will allocate an extra word, if
+//         necessary, for the object copy, and install 10.
+//    10 - fast-path: read hashcode from field
+//    TODO: We might want to place header bits such that the hashctrl are in the lowest 8 bits, and swap 00 and 11,
+//    then instruction encoding can be made very compact when testing for the fast-path: load 8 bits, mask and
+//    test for zero.
 //
 //  - the two lock bits are used to describe three states: locked/unlocked and monitor.
 //
@@ -67,6 +91,7 @@ class BasicLock;
 class ObjectMonitor;
 class JavaThread;
 class outputStream;
+typedef juint  narrowKlass;
 
 class markWord {
  private:
@@ -99,30 +124,55 @@ class markWord {
 
   // Conversion
   uintptr_t value() const { return _value; }
+  uint32_t value32() const { return (uint32_t)_value; }
 
   // Constants
   static const int age_bits                       = 4;
   static const int lock_bits                      = 2;
-  static const int first_unused_gap_bits          = 1;
-  static const int max_hash_bits                  = BitsPerWord - age_bits - lock_bits - first_unused_gap_bits;
+  static const int self_fwd_bits                  = 1;
+  static const int max_hash_bits                  = BitsPerWord - age_bits - lock_bits - self_fwd_bits;
   static const int hash_bits                      = max_hash_bits > 31 ? 31 : max_hash_bits;
-  static const int second_unused_gap_bits         = LP64_ONLY(1) NOT_LP64(0);
+  static const int unused_gap_bits                = LP64_ONLY(1) NOT_LP64(0);
+  static const int unused_gap_bits_compact        = 4; // Valhalla bits
+  static const int hashctrl_bits                  = 2;
 
   static const int lock_shift                     = 0;
-  static const int age_shift                      = lock_bits + first_unused_gap_bits;
-  static const int hash_shift                     = age_shift + age_bits + second_unused_gap_bits;
+  static const int self_fwd_shift                 = lock_shift + lock_bits;
+  static const int age_shift                      = self_fwd_shift + self_fwd_bits;
+  static const int hash_shift                     = age_shift + age_bits + unused_gap_bits;
+  // Used only with compact headers.
+  static const int hashctrl_shift                 = age_shift + age_bits + unused_gap_bits_compact;
 
   static const uintptr_t lock_mask                = right_n_bits(lock_bits);
   static const uintptr_t lock_mask_in_place       = lock_mask << lock_shift;
+  static const uintptr_t self_fwd_mask            = right_n_bits(self_fwd_bits);
+  static const uintptr_t self_fwd_mask_in_place   = self_fwd_mask << self_fwd_shift;
   static const uintptr_t age_mask                 = right_n_bits(age_bits);
   static const uintptr_t age_mask_in_place        = age_mask << age_shift;
   static const uintptr_t hash_mask                = right_n_bits(hash_bits);
   static const uintptr_t hash_mask_in_place       = hash_mask << hash_shift;
+  static const uintptr_t hashctrl_mask            = right_n_bits(hashctrl_bits);
+  static const uintptr_t hashctrl_mask_in_place   = hashctrl_mask << hashctrl_shift;
+  static const uintptr_t hashctrl_hashed_mask_in_place = ((uintptr_t)1) << hashctrl_shift;
+  static const uintptr_t hashctrl_copied_mask_in_place = ((uintptr_t)2) << hashctrl_shift;
+
+#ifdef _LP64
+  // Used only with compact headers:
+  // We store the (narrow) Klass* in the bits 43 to 64.
+
+  // These are for bit-precise extraction of the narrow Klass* from the 64-bit Markword
+  static constexpr int klass_shift                = hashctrl_shift + hashctrl_bits;
+  static constexpr int klass_bits                 = 19;
+  static constexpr uintptr_t klass_mask           = right_n_bits(klass_bits);
+  static constexpr uintptr_t klass_mask_in_place  = klass_mask << klass_shift;
+#endif
+
 
   static const uintptr_t locked_value             = 0;
   static const uintptr_t unlocked_value           = 1;
   static const uintptr_t monitor_value            = 2;
   static const uintptr_t marked_value             = 3;
+  static const uintptr_t forward_expanded_value   = 0b111;
 
   static const uintptr_t no_hash                  = 0 ;  // no hash value assigned
   static const uintptr_t no_hash_in_place         = (address_word)no_hash << hash_shift;
@@ -143,8 +193,20 @@ class markWord {
   bool is_marked()   const {
     return (mask_bits(value(), lock_mask_in_place) == marked_value);
   }
-  bool is_neutral()  const {
+  bool is_forwarded() const {
+    // Returns true for normal forwarded (0b011) and self-forwarded (0b1xx).
+    return mask_bits(value(), lock_mask_in_place | self_fwd_mask_in_place) >= static_cast<intptr_t>(marked_value);
+  }
+  bool is_neutral()  const {  // Not locked, or marked - a "clean" neutral state
     return (mask_bits(value(), lock_mask_in_place) == unlocked_value);
+  }
+
+  markWord set_forward_expanded() {
+    assert((value() & (lock_mask_in_place | self_fwd_mask_in_place)) == marked_value, "must be normal-forwarded here");
+    return markWord(value() | forward_expanded_value);
+  }
+  bool is_forward_expanded() {
+    return (value() & (lock_mask_in_place | self_fwd_mask_in_place)) == forward_expanded_value;
   }
 
   // Special temporary state of the markWord while being inflated.
@@ -162,7 +224,7 @@ class markWord {
 
   // Should this header be preserved during GC?
   bool must_be_preserved(const oopDesc* obj) const {
-    return (!is_unlocked() || !has_no_hash());
+    return UseCompactObjectHeaders ? !is_unlocked() : (!is_unlocked() || !has_no_hash());
   }
 
   // WARNING: The following routines are used EXCLUSIVELY by
@@ -194,17 +256,22 @@ class markWord {
   }
   ObjectMonitor* monitor() const {
     assert(has_monitor(), "check");
+    assert(!UseObjectMonitorTable, "Lightweight locking with OM table does not use markWord for monitors");
     // Use xor instead of &~ to provide one extra tag-bit check.
     return (ObjectMonitor*) (value() ^ monitor_value);
   }
   bool has_displaced_mark_helper() const {
     intptr_t lockbits = value() & lock_mask_in_place;
-    return LockingMode == LM_LIGHTWEIGHT  ? lockbits == monitor_value   // monitor?
-                                          : (lockbits & unlocked_value) == 0; // monitor | stack-locked?
+    if (LockingMode == LM_LIGHTWEIGHT) {
+      return !UseObjectMonitorTable && lockbits == monitor_value;
+    }
+    // monitor (0b10) | stack-locked (0b00)?
+    return (lockbits & unlocked_value) == 0;
   }
   markWord displaced_mark_helper() const;
   void set_displaced_mark_helper(markWord m) const;
   markWord copy_set_hash(intptr_t hash) const {
+    assert(!UseCompactObjectHeaders, "Do not use with compact i-hash");
     uintptr_t tmp = value() & (~hash_mask_in_place);
     tmp |= ((hash & hash_mask) << hash_shift);
     return markWord(tmp);
@@ -220,12 +287,17 @@ class markWord {
     return from_pointer(lock);
   }
   static markWord encode(ObjectMonitor* monitor) {
+    assert(!UseObjectMonitorTable, "Lightweight locking with OM table does not use markWord for monitors");
     uintptr_t tmp = (uintptr_t) monitor;
     return markWord(tmp | monitor_value);
   }
 
+  markWord set_has_monitor() const {
+    return markWord((value() & ~lock_mask_in_place) | monitor_value);
+  }
+
   // used to encode pointers during GC
-  markWord clear_lock_bits() { return markWord(value() & ~lock_mask_in_place); }
+  markWord clear_lock_bits() const { return markWord(value() & ~(lock_mask_in_place | self_fwd_mask_in_place)); }
 
   // age operations
   markWord set_marked()   { return markWord((value() & ~lock_mask_in_place) | marked_value); }
@@ -240,16 +312,70 @@ class markWord {
 
   // hash operations
   intptr_t hash() const {
+    assert(!UseCompactObjectHeaders, "only without compact i-hash");
     return mask_bits(value() >> hash_shift, hash_mask);
   }
 
   bool has_no_hash() const {
-    return hash() == no_hash;
+    if (UseCompactObjectHeaders) {
+      return (value() & hashctrl_mask_in_place) == 0;
+    } else {
+      return hash() == no_hash;
+    }
   }
+
+  inline bool hash_is_hashed() const {
+    assert(UseCompactObjectHeaders, "only with compact i-hash");
+    return (value() & hashctrl_hashed_mask_in_place) != 0;
+  }
+  inline markWord hash_set_hashed() const {
+    assert(UseCompactObjectHeaders, "only with compact i-hash");
+    return markWord((value() & ~hashctrl_mask_in_place) | hashctrl_hashed_mask_in_place);
+  }
+  inline markWord hash_clear_hashed() const {
+    assert(UseCompactObjectHeaders, "only with compact i-hash");
+    return markWord(value() & ~hashctrl_mask_in_place);
+  }
+  inline bool hash_is_copied() const {
+    assert(UseCompactObjectHeaders, "only with compact i-hash");
+    return (value() & hashctrl_copied_mask_in_place) != 0;
+  }
+  inline markWord hash_set_copied() const {
+    assert(UseCompactObjectHeaders, "only with compact i-hash");
+    return markWord((value() & ~hashctrl_mask_in_place) | hashctrl_copied_mask_in_place);
+  }
+  inline markWord hash_clear_copied() const {
+    assert(UseCompactObjectHeaders, "only with compact i-hash");
+    return markWord(value() & ~hashctrl_mask_in_place);
+  }
+  inline bool hash_is_hashed_or_copied() const {
+    assert(UseCompactObjectHeaders, "only with compact i-hash");
+    return (value() & hashctrl_mask_in_place) != 0;
+  }
+  int hashctrl() const {
+    assert(UseCompactObjectHeaders, "only with compact i-hash");
+    return (int)((value() & hashctrl_mask_in_place) >> hashctrl_shift);
+  }
+  inline markWord hash_copy_hashctrl_from(markWord m) const {
+    if (UseCompactObjectHeaders) {
+      return markWord((value() & ~hashctrl_mask_in_place) | (m.value() & hashctrl_mask_in_place));
+    } else {
+      return markWord(value());
+    }
+  }
+
+#ifdef _LP64
+  inline markWord actual_mark() const;
+  inline Klass* klass() const;
+  inline Klass* klass_or_null() const;
+  inline narrowKlass narrow_klass() const;
+  inline markWord set_narrow_klass(narrowKlass nklass) const;
+  inline markWord set_klass(Klass* klass) const;
+#endif
 
   // Prototype mark for initialization
   static markWord prototype() {
-    return markWord( no_hash_in_place | no_lock_in_place );
+    return markWord(no_hash_in_place | no_lock_in_place);
   }
 
   // Debugging
@@ -259,7 +385,27 @@ class markWord {
   inline static markWord encode_pointer_as_mark(void* p) { return from_pointer(p).set_marked(); }
 
   // Recover address of oop from encoded form used in mark
-  inline void* decode_pointer() { return (void*)clear_lock_bits().value(); }
+  inline void* decode_pointer() const { return (void*)clear_lock_bits().value(); }
+
+  inline bool is_self_forwarded() const {
+    NOT_LP64(assert(LockingMode != LM_LEGACY, "incorrect with LM_LEGACY on 32 bit");)
+    // Match 100, 101, 110 but not 111.
+    return mask_bits(value() + 1, (lock_mask_in_place | self_fwd_mask_in_place)) > 4;
+  }
+
+  inline markWord set_self_forwarded() const {
+    NOT_LP64(assert(LockingMode != LM_LEGACY, "incorrect with LM_LEGACY on 32 bit");)
+    return markWord(value() | self_fwd_mask_in_place);
+  }
+
+  inline markWord unset_self_forwarded() const {
+    NOT_LP64(assert(LockingMode != LM_LEGACY, "incorrect with LM_LEGACY on 32 bit");)
+    return markWord(value() & ~self_fwd_mask_in_place);
+  }
+
+  inline oop forwardee() const {
+    return cast_to_oop(decode_pointer());
+  }
 };
 
 // Support atomic operations.

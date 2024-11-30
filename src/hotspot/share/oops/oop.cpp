@@ -30,6 +30,7 @@
 #include "memory/resourceArea.hpp"
 #include "memory/universe.hpp"
 #include "oops/access.inline.hpp"
+#include "oops/compressedKlass.inline.hpp"
 #include "oops/compressedOops.inline.hpp"
 #include "oops/oop.inline.hpp"
 #include "oops/verifyOopClosure.hpp"
@@ -156,7 +157,8 @@ bool oopDesc::is_typeArray_noinline()   const { return is_typeArray();   }
 
 bool oopDesc::has_klass_gap() {
   // Only has a klass gap when compressed class pointers are used.
-  return UseCompressedClassPointers;
+  // Except when using compact headers.
+  return UseCompressedClassPointers || UseCompactObjectHeaders;
 }
 
 #if INCLUDE_CDS_JAVA_HEAP
@@ -168,10 +170,12 @@ void oopDesc::set_narrow_klass(narrowKlass nk) {
 #endif
 
 void* oopDesc::load_klass_raw(oop obj) {
-  if (UseCompressedClassPointers) {
+  if (UseCompactObjectHeaders) {
+    return obj->klass();
+  } else if (UseCompressedClassPointers) {
     narrowKlass narrow_klass = obj->_metadata._compressed_klass;
     if (narrow_klass == 0) return nullptr;
-    return (void*)CompressedKlassPointers::decode_raw(narrow_klass);
+    return (void*)CompressedKlassPointers::decode_without_asserts(narrow_klass);
   } else {
     return obj->_metadata._klass;
   }
@@ -238,6 +242,6 @@ bool oopDesc::size_might_change() {
   // the grey portion of an already copied array. This will cause the first
   // disjunct below to fail if the two comparands are computed across such
   // a concurrent change.
-  return Universe::heap()->is_stw_gc_active() && is_objArray() && is_forwarded() && (UseParallelGC || UseG1GC);
+  return UseCompactObjectHeaders || (Universe::heap()->is_stw_gc_active() && is_objArray() && is_forwarded() && (UseParallelGC || UseG1GC));
 }
 #endif

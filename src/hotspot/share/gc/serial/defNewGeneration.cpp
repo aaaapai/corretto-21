@@ -41,7 +41,6 @@
 #include "gc/shared/gcTrace.hpp"
 #include "gc/shared/gcTraceTime.inline.hpp"
 #include "gc/shared/generationSpec.hpp"
-#include "gc/shared/preservedMarks.inline.hpp"
 #include "gc/shared/referencePolicy.hpp"
 #include "gc/shared/referenceProcessorPhaseTimes.hpp"
 #include "gc/shared/space.inline.hpp"
@@ -330,7 +329,6 @@ DefNewGeneration::DefNewGeneration(ReservedSpace rs,
                                    size_t max_size,
                                    const char* policy)
   : Generation(rs, initial_size),
-    _preserved_marks_set(false /* in_c_heap */),
     _promo_failure_drain_in_progress(false),
     _should_allocate_from_space(false),
     _string_dedup_requests()
@@ -758,8 +756,6 @@ void DefNewGeneration::collect(bool   full,
 
   age_table()->clear();
   to()->clear(SpaceDecorator::Mangle);
-  // The preserved marks should be empty at the start of the GC.
-  _preserved_marks_set.init(1);
 
   assert(heap->no_allocs_since_save_marks(),
          "save marks have not been newly set.");
@@ -857,8 +853,6 @@ void DefNewGeneration::collect(bool   full,
     // Reset the PromotionFailureALot counters.
     NOT_PRODUCT(heap->reset_promotion_should_fail();)
   }
-  // We should have processed and cleared all the preserved marks.
-  _preserved_marks_set.reclaim();
 
   heap->trace_heap_after_gc(_gc_tracer);
 
@@ -879,21 +873,19 @@ void DefNewGeneration::remove_forwarding_pointers() {
   // Will enter Full GC soon due to failed promotion. Must reset the mark word
   // of objs in young-gen so that no objs are marked (forwarded) when Full GC
   // starts. (The mark word is overloaded: `is_marked()` == `is_forwarded()`.)
-  struct ResetForwardedMarkWord : ObjectClosure {
-    void do_object(oop obj) override {
-      if (obj->is_forwarded()) {
-        obj->init_mark();
+  struct ResetForwardedMarkWord {
+    size_t do_object(oop obj) {
+      if (obj->is_self_forwarded()) {
+	tty->print_cr("reset self fwd: " PTR_FORMAT ", mark: " INTPTR_FORMAT, p2i(obj), obj->mark().value());
+        obj->unset_self_forwarded();
+      } else if (obj->is_forwarded()) {
+        obj->forward_safe_init_mark();
       }
+      return obj->size();
     }
   } cl;
-  eden()->object_iterate(&cl);
-  from()->object_iterate(&cl);
-
-  restore_preserved_marks();
-}
-
-void DefNewGeneration::restore_preserved_marks() {
-  _preserved_marks_set.restore(nullptr);
+  eden()->object_iterate_sized(&cl);
+  from()->object_iterate_sized(&cl);
 }
 
 void DefNewGeneration::handle_promotion_failure(oop old) {
@@ -901,12 +893,10 @@ void DefNewGeneration::handle_promotion_failure(oop old) {
 
   _promotion_failed = true;
   _promotion_failed_info.register_copy_failure(old->size());
-  _preserved_marks_set.get()->push_if_necessary(old, old->mark());
 
   ContinuationGCSupport::transform_stack_chunk(old);
 
-  // forward to self
-  old->forward_to(old);
+  old->forward_to_self();
 
   _promo_failure_scan_stack.push(old);
 
@@ -921,7 +911,8 @@ void DefNewGeneration::handle_promotion_failure(oop old) {
 oop DefNewGeneration::copy_to_survivor_space(oop old) {
   assert(is_in_reserved(old) && !old->is_forwarded(),
          "shouldn't be scavenging this oop");
-  size_t s = old->size();
+  size_t old_size = old->size();
+  size_t s = old->copy_size(old_size, old->mark());
   oop obj = nullptr;
 
   // Try allocating obj in to-space (unless too old)
@@ -932,7 +923,7 @@ oop DefNewGeneration::copy_to_survivor_space(oop old) {
   bool new_obj_is_tenured = false;
   // Otherwise try allocating obj tenured
   if (obj == nullptr) {
-    obj = _old_gen->promote(old, s);
+    obj = _old_gen->promote(old, old_size, s);
     if (obj == nullptr) {
       handle_promotion_failure(old);
       return old;
@@ -944,7 +935,7 @@ oop DefNewGeneration::copy_to_survivor_space(oop old) {
     Prefetch::write(obj, interval);
 
     // Copy obj
-    Copy::aligned_disjoint_words(cast_from_oop<HeapWord*>(old), cast_from_oop<HeapWord*>(obj), s);
+    Copy::aligned_disjoint_words(cast_from_oop<HeapWord*>(old), cast_from_oop<HeapWord*>(obj), old_size);
 
     ContinuationGCSupport::transform_stack_chunk(obj);
 
@@ -953,8 +944,10 @@ oop DefNewGeneration::copy_to_survivor_space(oop old) {
     age_table()->add(obj, s);
   }
 
+  bool expanded = obj->initialize_hash_if_necessary(old);
+
   // Done, insert forward pointer to obj in this header
-  old->forward_to(obj);
+  old->forward_to(obj, expanded);
 
   if (SerialStringDedup::is_candidate_from_evacuation(obj, new_obj_is_tenured)) {
     // Record old; request adds a new weak reference, which reference

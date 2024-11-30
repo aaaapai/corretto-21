@@ -47,12 +47,10 @@ ZInitialize::ZInitialize(ZBarrierSet* barrier_set) {
 
   // Early initialization
   ZGlobalsPointers::initialize();
-  ZNUMA::initialize();
   ZCPU::initialize();
   ZStatValue::initialize();
   ZThreadLocalAllocBuffer::initialize();
   ZTracer::initialize();
-  ZLargePages::initialize();
   ZBarrierSet::set_barrier_set(barrier_set);
   ZJNICritical::initialize();
   ZDriver::initialize();

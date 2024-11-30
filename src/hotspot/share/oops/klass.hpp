@@ -165,6 +165,8 @@ class Klass : public Metadata {
                                 // contention that may happen when a nearby object is modified.
   AccessFlags _access_flags;    // Access flags. The class/interface distinction is stored here.
 
+  markWord _prototype_header;   // Used to initialize objects' header
+
   JFR_ONLY(DEFINE_TRACE_ID_FIELD;)
 
 private:
@@ -196,8 +198,6 @@ protected:
   // Constructor
   Klass(KlassKind kind);
   Klass() : _kind(UnknownKlassKind) { assert(DumpSharedSpaces || UseSharedSpaces, "only for cds"); }
-
-  void* operator new(size_t size, ClassLoaderData* loader_data, size_t word_size, TRAPS) throw();
 
  public:
   int kind() { return _kind; }
@@ -676,6 +676,13 @@ protected:
   bool is_cloneable() const;
   void set_is_cloneable();
 
+  markWord prototype_header() const {
+    assert(UseCompactObjectHeaders, "only use with compact object headers");
+    return _prototype_header;
+  }
+  inline void set_prototype_header(markWord header);
+  static ByteSize prototype_header_offset() { return in_ByteSize(offset_of(Klass, _prototype_header)); }
+
   JFR_ONLY(DEFINE_TRACE_ID_METHODS;)
 
   virtual void metaspace_pointers_do(MetaspaceClosure* iter);
@@ -726,6 +733,13 @@ protected:
 
   // for error reporting
   static bool is_valid(Klass* k);
+
+  // Returns true if this Klass needs to be addressable via narrow Klass ID.
+  inline bool needs_narrow_id() const;
+
+  virtual int hash_offset_in_bytes(oop obj) const = 0;
+  static int kind_offset_in_bytes() { return (int)offset_of(Klass, _kind); }
+  bool hash_requires_reallocation(oop obj) const;
 };
 
 #endif // SHARE_OOPS_KLASS_HPP

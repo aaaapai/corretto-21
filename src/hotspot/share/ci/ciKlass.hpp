@@ -75,6 +75,9 @@ protected:
 public:
   ciKlass(Klass* k);
 
+  bool is_mirror_instance_klass() { return get_Klass()->is_mirror_instance_klass(); }
+  bool is_reference_instance_klass() { return get_Klass()->is_reference_instance_klass(); }
+
   // What is the name of this klass?
   ciSymbol* name() const { return _name; }
 
@@ -129,6 +132,9 @@ public:
   void print_name_on(outputStream* st);
 
   const char* external_name() const;
+
+  juint prototype_header_offset();
+  uintptr_t prototype_header();
 };
 
 #endif // SHARE_CI_CIKLASS_HPP

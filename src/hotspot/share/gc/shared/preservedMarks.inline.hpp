@@ -26,6 +26,7 @@
 #define SHARE_GC_SHARED_PRESERVEDMARKS_INLINE_HPP
 
 #include "gc/shared/preservedMarks.hpp"
+#include "gc/shared/slidingForwarding.inline.hpp"
 
 #include "logging/log.hpp"
 #include "oops/oop.inline.hpp"
@@ -57,7 +58,7 @@ inline PreservedMarks::PreservedMarks()
              0 /* max_cache_size */) { }
 
 void PreservedMarks::OopAndMarkWord::set_mark() const {
-  _o->set_mark(_m);
+  _o->set_mark(_m.hash_copy_hashctrl_from(_o->mark()));
 }
 
 #endif // SHARE_GC_SHARED_PRESERVEDMARKS_INLINE_HPP

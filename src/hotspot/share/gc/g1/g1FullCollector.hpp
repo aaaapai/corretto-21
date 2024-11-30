@@ -158,7 +158,9 @@ private:
 
   void phase2a_determine_worklists();
   bool phase2b_forward_oops();
+  void phase2c_prepare_serial_compaction_impl();
   void phase2c_prepare_serial_compaction();
+  void phase2d_prepare_humongous_compaction_impl();
   void phase2d_prepare_humongous_compaction();
 
   void phase3_adjust_pointers();

@@ -46,6 +46,8 @@ class G1FullGCCompactTask : public G1FullGCTask {
 
   static void copy_object_to_new_location(oop obj);
 
+  void humongous_compaction_impl();
+
 public:
   G1FullGCCompactTask(G1FullCollector* collector) :
     G1FullGCTask("G1 Compact Task", collector),

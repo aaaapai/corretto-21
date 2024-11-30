@@ -311,7 +311,15 @@ private:
 
   static inline void clear_empty_region(ContiguousSpace* space);
 
- protected:
+#if INCLUDE_SERIALGC
+  void prepare_for_compaction_impl(CompactPoint* cp);
+
+  void adjust_pointers_impl();
+
+  void compact_impl();
+#endif
+
+protected:
   HeapWord* _top;
   // A helper for mangling the unused area of the space in debug builds.
   GenSpaceMangler* _mangler;
@@ -398,7 +406,7 @@ private:
   // and then forward.  In either case, returns the new value of "compact_top".
   // Invokes the "alloc_block" function of the then-current compaction
   // space.
-  virtual HeapWord* forward(oop q, size_t size, CompactPoint* cp,
+  HeapWord* forward(oop q, size_t old_size, size_t new_size, CompactPoint* cp,
                     HeapWord* compact_top);
 
   // Accessors
@@ -446,6 +454,8 @@ private:
   // Iteration
   void oop_iterate(OopIterateClosure* cl) override;
   void object_iterate(ObjectClosure* blk) override;
+  template<class CL>
+  void object_iterate_sized(CL* blk);
 
   // Compaction support
   void reset_after_compaction() {

@@ -241,6 +241,7 @@
   volatile_nonstatic_field(InstanceKlass,      _init_thread,                                  JavaThread*)                           \
   nonstatic_field(InstanceKlass,               _is_marked_dependent,                          bool)                                  \
   nonstatic_field(InstanceKlass,               _itable_len,                                   int)                                   \
+  nonstatic_field(InstanceKlass,               _hash_offset,                                  int)                                    \
   nonstatic_field(InstanceKlass,               _reference_type,                               u1)                                    \
   volatile_nonstatic_field(InstanceKlass,      _oop_map_cache,                                OopMapCache*)                          \
   nonstatic_field(InstanceKlass,               _jni_ids,                                      JNIid*)                                \
@@ -379,8 +380,8 @@
   /* CompressedKlassPointers */                                                                                                      \
   /***************************/                                                                                                      \
                                                                                                                                      \
-     static_field(CompressedKlassPointers,     _narrow_klass._base,                           address)                               \
-     static_field(CompressedKlassPointers,     _narrow_klass._shift,                          int)                                   \
+     static_field(CompressedKlassPointers,     _base,                                         address)                               \
+     static_field(CompressedKlassPointers,     _shift,                                        int)                                   \
                                                                                                                                      \
   /**********/                                                                                                                       \
   /* Memory */                                                                                                                       \
@@ -848,11 +849,11 @@
   /* Monitors */                                                                                                                     \
   /************/                                                                                                                     \
                                                                                                                                      \
-  volatile_nonstatic_field(ObjectMonitor,      _header,                                       markWord)                              \
+  volatile_nonstatic_field(ObjectMonitor,      _metadata,                                     uintptr_t)                             \
   unchecked_nonstatic_field(ObjectMonitor,     _object,                                       sizeof(void *)) /* NOTE: no type */    \
   unchecked_nonstatic_field(ObjectMonitor,     _owner,                                        sizeof(void *)) /* NOTE: no type */    \
   volatile_nonstatic_field(ObjectMonitor,      _next_om,                                      ObjectMonitor*)                        \
-  volatile_nonstatic_field(BasicLock,          _displaced_header,                             markWord)                              \
+  volatile_nonstatic_field(BasicLock,          _metadata,                                     uintptr_t)                             \
   nonstatic_field(ObjectMonitor,               _contentions,                                  int)                                   \
   volatile_nonstatic_field(ObjectMonitor,      _waiters,                                      int)                                   \
   volatile_nonstatic_field(ObjectMonitor,      _recursions,                                   intx)                                  \
@@ -2064,8 +2065,6 @@
   declare_constant(BytesPerWord)                                          \
   declare_constant(BytesPerLong)                                          \
                                                                           \
-  declare_constant(LogKlassAlignmentInBytes)                              \
-                                                                          \
   declare_constant(HeapWordSize)                                          \
   declare_constant(LogHeapWordSize)                                       \
                                                                           \
@@ -2581,10 +2580,13 @@
   declare_constant(markWord::lock_bits)                                   \
   declare_constant(markWord::max_hash_bits)                               \
   declare_constant(markWord::hash_bits)                                   \
+  declare_constant(markWord::hashctrl_bits)                               \
                                                                           \
   declare_constant(markWord::lock_shift)                                  \
   declare_constant(markWord::age_shift)                                   \
   declare_constant(markWord::hash_shift)                                  \
+  declare_constant(markWord::hashctrl_shift)                              \
+  LP64_ONLY(declare_constant(markWord::klass_shift))                      \
                                                                           \
   declare_constant(markWord::lock_mask)                                   \
   declare_constant(markWord::lock_mask_in_place)                          \
@@ -2592,6 +2594,8 @@
   declare_constant(markWord::age_mask_in_place)                           \
   declare_constant(markWord::hash_mask)                                   \
   declare_constant(markWord::hash_mask_in_place)                          \
+  declare_constant(markWord::hashctrl_mask)                               \
+  declare_constant(markWord::hashctrl_mask_in_place)                      \
                                                                           \
   declare_constant(markWord::locked_value)                                \
   declare_constant(markWord::unlocked_value)                              \

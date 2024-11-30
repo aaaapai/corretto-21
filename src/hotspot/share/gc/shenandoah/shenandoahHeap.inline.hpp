@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2015, 2020, Red Hat, Inc. All rights reserved.
+ * Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -40,14 +41,16 @@
 #include "gc/shenandoah/shenandoahWorkGroup.hpp"
 #include "gc/shenandoah/shenandoahHeapRegionSet.inline.hpp"
 #include "gc/shenandoah/shenandoahHeapRegion.inline.hpp"
-#include "gc/shenandoah/shenandoahControlThread.hpp"
+#include "gc/shenandoah/shenandoahGeneration.hpp"
 #include "gc/shenandoah/shenandoahMarkingContext.inline.hpp"
 #include "gc/shenandoah/shenandoahThreadLocalData.hpp"
+#include "gc/shenandoah/mode/shenandoahMode.hpp"
 #include "oops/compressedOops.inline.hpp"
 #include "oops/oop.inline.hpp"
 #include "runtime/atomic.hpp"
 #include "runtime/javaThread.hpp"
 #include "runtime/prefetch.inline.hpp"
+#include "runtime/objectMonitor.inline.hpp"
 #include "utilities/copy.hpp"
 #include "utilities/globalDefinitions.hpp"
 
@@ -73,6 +76,18 @@ inline WorkerThreads* ShenandoahHeap::safepoint_workers() {
   return _safepoint_workers;
 }
 
+inline void ShenandoahHeap::notify_gc_progress() {
+  Atomic::store(&_gc_no_progress_count, (size_t) 0);
+
+}
+inline void ShenandoahHeap::notify_gc_no_progress() {
+  Atomic::inc(&_gc_no_progress_count);
+}
+
+inline size_t ShenandoahHeap::get_gc_no_progress_count() const {
+  return Atomic::load(&_gc_no_progress_count);
+}
+
 inline size_t ShenandoahHeap::heap_region_index_containing(const void* addr) const {
   uintptr_t region_start = ((uintptr_t) addr);
   uintptr_t index = (region_start - (uintptr_t) base()) >> ShenandoahHeapRegion::region_size_bytes_shift();
@@ -80,7 +95,7 @@ inline size_t ShenandoahHeap::heap_region_index_containing(const void* addr) con
   return index;
 }
 
-inline ShenandoahHeapRegion* const ShenandoahHeap::heap_region_containing(const void* addr) const {
+inline ShenandoahHeapRegion* ShenandoahHeap::heap_region_containing(const void* addr) const {
   size_t index = heap_region_index_containing(addr);
   ShenandoahHeapRegion* const result = get_region(index);
   assert(addr >= result->bottom() && addr < result->end(), "Heap region contains the address: " PTR_FORMAT, p2i(addr));
@@ -252,9 +267,17 @@ inline bool ShenandoahHeap::check_cancelled_gc_and_yield(bool sts_active) {
   return cancelled_gc();
 }
 
-inline void ShenandoahHeap::clear_cancelled_gc() {
+inline void ShenandoahHeap::clear_cancelled_gc(bool clear_oom_handler) {
   _cancelled_gc.set(CANCELLABLE);
-  _oom_evac_handler.clear();
+  if (_cancel_requested_time > 0) {
+    double cancel_time = os::elapsedTime() - _cancel_requested_time;
+    log_info(gc)("GC cancellation took %.3fs", cancel_time);
+    _cancel_requested_time = 0;
+  }
+
+  if (clear_oom_handler) {
+    _oom_evac_handler.clear();
+  }
 }
 
 inline HeapWord* ShenandoahHeap::allocate_from_gclab(Thread* thread, size_t size) {
@@ -271,59 +294,132 @@ inline HeapWord* ShenandoahHeap::allocate_from_gclab(Thread* thread, size_t size
   if (obj != nullptr) {
     return obj;
   }
-  // Otherwise...
   return allocate_from_gclab_slow(thread, size);
 }
 
-inline oop ShenandoahHeap::evacuate_object(oop p, Thread* thread) {
-  if (ShenandoahThreadLocalData::is_oom_during_evac(Thread::current())) {
-    // This thread went through the OOM during evac protocol and it is safe to return
-    // the forward pointer. It must not attempt to evacuate any more.
-    return ShenandoahBarrierSet::resolve_forwarded(p);
+void ShenandoahHeap::increase_object_age(oop obj, uint additional_age) {
+  // This operates on new copy of an object. This means that the object's mark-word
+  // is thread-local and therefore safe to access. However, when the mark is
+  // displaced (i.e. stack-locked or monitor-locked), then it must be considered
+  // a shared memory location. It can be accessed by other threads.
+  // In particular, a competing evacuating thread can succeed to install its copy
+  // as the forwardee and continue to unlock the object, at which point 'our'
+  // write to the foreign stack-location would potentially over-write random
+  // information on that stack. Writing to a monitor is less problematic,
+  // but still not safe: while the ObjectMonitor would not randomly disappear,
+  // the other thread would also write to the same displaced header location,
+  // possibly leading to increase the age twice.
+  // For all these reasons, we take the conservative approach and not attempt
+  // to increase the age when the header is displaced.
+  markWord w = obj->mark();
+  // The mark-word has been copied from the original object. It can not be
+  // inflating, because inflation can not be interrupted by a safepoint,
+  // and after a safepoint, a Java thread would first have to successfully
+  // evacuate the object before it could inflate the monitor.
+  assert(!w.is_being_inflated() || LockingMode == LM_LIGHTWEIGHT, "must not inflate monitor before evacuation of object succeeds");
+  // It is possible that we have copied the object after another thread has
+  // already successfully completed evacuation. While harmless (we would never
+  // publish our copy), don't even attempt to modify the age when that
+  // happens.
+  if (!w.has_displaced_mark_helper() && !w.is_marked()) {
+    w = w.set_age(MIN2(markWord::max_age, w.age() + additional_age));
+    obj->set_mark(w);
   }
+}
 
-  assert(ShenandoahThreadLocalData::is_evac_allowed(thread), "must be enclosed in oom-evac scope");
+// Return the object's age, or a sentinel value when the age can't
+// necessarily be determined because of concurrent locking by the
+// mutator
+uint ShenandoahHeap::get_object_age(oop obj) {
+  // This is impossible to do unless we "freeze" ABA-type oscillations
+  // With Lilliput, we can do this more easily.
+  markWord w = obj->mark();
+  assert(!w.is_marked(), "must not be forwarded");
+  if (w.has_monitor()) {
+    w = w.monitor()->header();
+  } else if (w.is_being_inflated() || w.has_displaced_mark_helper()) {
+    // Informs caller that we aren't able to determine the age
+    return markWord::max_age + 1; // sentinel
+  }
+  assert(w.age() <= markWord::max_age, "Impossible!");
+  return w.age();
+}
 
-  size_t size = p->size();
-
+  markWord mark = p->mark();
+  if (ShenandoahForwarding::is_forwarded(mark)) {
+    return ShenandoahForwarding::get_forwardee(p);
+  }
+  size_t old_size = ShenandoahForwarding::object_size(p);
+  size_t size = p->copy_size(old_size, mark);
   assert(!heap_region_containing(p)->is_humongous(), "never evacuate humongous objects");
 
-  bool alloc_from_gclab = true;
-  HeapWord* copy = nullptr;
+  ShenandoahGeneration* const gen = active_generation();
 
-#ifdef ASSERT
-  if (ShenandoahOOMDuringEvacALot &&
-      (os::random() & 1) == 0) { // Simulate OOM every ~2nd slow-path call
-        copy = nullptr;
-  } else {
-#endif
-    if (UseTLAB) {
-      copy = allocate_from_gclab(thread, size);
-    }
-    if (copy == nullptr) {
-      ShenandoahAllocRequest req = ShenandoahAllocRequest::for_shared_gc(size);
-      copy = allocate_memory(req);
-      alloc_from_gclab = false;
-    }
-#ifdef ASSERT
+  if (gen == nullptr) {
+    // no collection is happening: only expect this to be called
+    // when concurrent processing is active, but that could change
+    return false;
   }
-#endif
 
-  if (copy == nullptr) {
-    control_thread()->handle_alloc_failure_evac(size);
+  assert(is_in(obj), "only check if is in active generation for objects (" PTR_FORMAT ") in heap", p2i(obj));
+  assert(gen->is_old() || gen->is_young() || gen->is_global(),
+         "Active generation must be old, young, or global");
 
-    _oom_evac_handler.handle_out_of_memory_during_evacuation();
+  size_t index = heap_region_containing(obj)->index();
 
-    return ShenandoahBarrierSet::resolve_forwarded(p);
+  // No flickering!
+  assert(gen == active_generation(), "Race?");
+
+  switch (_affiliations[index]) {
+  case ShenandoahAffiliation::FREE:
+    // Free regions are in Old, Young, Global
+    return true;
+  case ShenandoahAffiliation::YOUNG_GENERATION:
+    // Young regions are in young_generation and global_generation, not in old_generation
+    return gen != (ShenandoahGeneration*)old_generation();
+  case ShenandoahAffiliation::OLD_GENERATION:
+    // Old regions are in old_generation and global_generation, not in young_generation
+    return gen != (ShenandoahGeneration*)young_generation();
+  default:
+    assert(false, "Bad affiliation (%d) for region " SIZE_FORMAT, _affiliations[index], index);
+    return false;
   }
+}
+
+inline bool ShenandoahHeap::is_in_young(const void* p) const {
+  return is_in(p) && (_affiliations[heap_region_index_containing(p)] == ShenandoahAffiliation::YOUNG_GENERATION);
+}
+
+inline bool ShenandoahHeap::is_in_old(const void* p) const {
+  return is_in(p) && (_affiliations[heap_region_index_containing(p)] == ShenandoahAffiliation::OLD_GENERATION);
+}
+
+inline bool ShenandoahHeap::is_old(oop obj) const {
+  return active_generation()->is_young() && is_in_old(obj);
+}
 
   // Copy the object:
-  Copy::aligned_disjoint_words(cast_from_oop<HeapWord*>(p), copy, size);
+  Copy::aligned_disjoint_words(cast_from_oop<HeapWord*>(p), copy, old_size);
+  oop copy_val = cast_to_oop(copy);
+
+  if (UseCompactObjectHeaders) {
+    // The copy above is not atomic. Make sure we have seen the proper mark
+    // and re-install it into the copy, so that Klass* is guaranteed to be correct.
+    markWord mark = copy_val->mark();
+    if (!mark.is_marked()) {
+      copy_val->set_mark(mark);
+      copy_val->initialize_hash_if_necessary(p);
+      ContinuationGCSupport::relativize_stack_chunk(copy_val);
+    } else {
+      // If we copied a mark-word that indicates 'forwarded' state, the object
+      // installation would not succeed. We cannot access Klass* anymore either.
+      // Skip the transformation.
+    }
+  } else {
+    ContinuationGCSupport::relativize_stack_chunk(copy_val);
+  }
 
   // Try to install the new forwarding pointer.
-  oop copy_val = cast_to_oop(copy);
-  ContinuationGCSupport::relativize_stack_chunk(copy_val);
-
   oop result = ShenandoahForwarding::try_update_forwardee(p, copy_val);
   if (result == copy_val) {
     // Successfully evacuated. Our copy is now the public one!
@@ -352,6 +448,17 @@ inline oop ShenandoahHeap::evacuate_object(oop p, Thread* thread) {
   }
 }
 
+inline void ShenandoahHeap::set_affiliation(ShenandoahHeapRegion* r, ShenandoahAffiliation new_affiliation) {
+#ifdef ASSERT
+  assert_lock_for_affiliation(region_affiliation(r), new_affiliation);
+#endif
+  _affiliations[r->index()] = (uint8_t) new_affiliation;
+}
+
+inline ShenandoahAffiliation ShenandoahHeap::region_affiliation(size_t index) {
+  return (ShenandoahAffiliation) _affiliations[index];
+}
+
 inline bool ShenandoahHeap::requires_marking(const void* entry) const {
   oop obj = cast_to_oop(entry);
   return !_marking_context->is_marked_strong(obj);
@@ -377,6 +484,14 @@ inline bool ShenandoahHeap::is_idle() const {
 
 inline bool ShenandoahHeap::is_concurrent_mark_in_progress() const {
   return _gc_state.is_set(MARKING);
+}
+
+inline bool ShenandoahHeap::is_concurrent_young_mark_in_progress() const {
+  return _gc_state.is_set(YOUNG_MARKING);
+}
+
+inline bool ShenandoahHeap::is_concurrent_old_mark_in_progress() const {
+  return _gc_state.is_set(OLD_MARKING);
 }
 
 inline bool ShenandoahHeap::is_evacuation_in_progress() const {
@@ -420,8 +535,7 @@ template<class T>
 inline void ShenandoahHeap::marked_object_iterate(ShenandoahHeapRegion* region, T* cl, HeapWord* limit) {
   assert(! region->is_humongous_continuation(), "no humongous continuation regions here");
 
-  ShenandoahMarkingContext* const ctx = complete_marking_context();
-  assert(ctx->is_complete(), "sanity");
+  ShenandoahMarkingContext* const ctx = marking_context();
 
   HeapWord* tams = ctx->top_at_mark_start(region);
 
@@ -499,7 +613,8 @@ inline void ShenandoahHeap::marked_object_iterate(ShenandoahHeapRegion* region, 
     oop obj = cast_to_oop(cs);
     assert(oopDesc::is_oop(obj), "sanity");
     assert(ctx->is_marked(obj), "object expected to be marked");
-    size_t size = obj->size();
+    assert(!is_full_gc_in_progress(), "No size-based iteration in full-GC");
+    size_t size = ShenandoahForwarding::object_size(obj);
     cl->do_object(obj);
     cs += size;
   }
@@ -544,20 +659,12 @@ inline void ShenandoahHeap::marked_object_oop_iterate(ShenandoahHeapRegion* regi
   }
 }
 
-inline ShenandoahHeapRegion* const ShenandoahHeap::get_region(size_t region_idx) const {
+inline ShenandoahHeapRegion* ShenandoahHeap::get_region(size_t region_idx) const {
   if (region_idx < _num_regions) {
     return _regions[region_idx];
   } else {
     return nullptr;
   }
-}
-
-inline void ShenandoahHeap::mark_complete_marking_context() {
-  _marking_context->mark_complete();
-}
-
-inline void ShenandoahHeap::mark_incomplete_marking_context() {
-  _marking_context->mark_incomplete();
 }
 
 inline ShenandoahMarkingContext* ShenandoahHeap::complete_marking_context() const {

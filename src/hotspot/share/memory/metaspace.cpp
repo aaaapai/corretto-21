@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2011, 2023, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2017, 2021 SAP SE. All rights reserved.
+ * Copyright (c) 2023, Red Hat, Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -47,6 +48,7 @@
 #include "memory/metaspaceUtils.hpp"
 #include "memory/resourceArea.hpp"
 #include "memory/universe.hpp"
+#include "oops/compressedKlass.inline.hpp"
 #include "oops/compressedOops.hpp"
 #include "prims/jvmtiExport.hpp"
 #include "runtime/atomic.hpp"
@@ -58,6 +60,7 @@
 #include "utilities/debug.hpp"
 #include "utilities/formatBuffer.hpp"
 #include "utilities/globalDefinitions.hpp"
+#include "virtualspace.hpp"
 
 using metaspace::ChunkManager;
 using metaspace::CommitLimiter;
@@ -535,6 +538,8 @@ void MetaspaceGC::compute_new_size() {
 //////  Metaspace methods /////
 
 const MetaspaceTracer* Metaspace::_tracer = nullptr;
+const void* Metaspace::_class_space_start = nullptr;
+const void* Metaspace::_class_space_end = nullptr;
 
 bool Metaspace::initialized() {
   return metaspace::MetaspaceContext::context_nonclass() != nullptr
@@ -567,6 +572,8 @@ void Metaspace::initialize_class_space(ReservedSpace rs) {
          "wrong alignment");
 
   MetaspaceContext::initialize_class_space_context(rs);
+  _class_space_start = rs.base();
+  _class_space_end = rs.end();
 }
 
 // Returns true if class space has been setup (initialize_class_space).
@@ -574,88 +581,34 @@ bool Metaspace::class_space_is_initialized() {
   return MetaspaceContext::context_class() != nullptr;
 }
 
-// Reserve a range of memory at an address suitable for en/decoding narrow
-// Klass pointers (see: CompressedClassPointers::is_valid_base()).
-// The returned address shall both be suitable as a compressed class pointers
-//  base, and aligned to Metaspace::reserve_alignment (which is equal to or a
-//  multiple of allocation granularity).
-// On error, returns an unreserved space.
-ReservedSpace Metaspace::reserve_address_space_for_compressed_classes(size_t size) {
+// Reserve a range of memory that is to contain narrow Klass IDs. If "try_in_low_address_ranges"
+// is true, we will attempt to reserve memory suitable for zero-based encoding.
+ReservedSpace Metaspace::reserve_address_space_for_compressed_classes(size_t size, bool optimize_for_zero_base) {
+  char* result = nullptr;
 
-#if defined(AARCH64) || defined(PPC64)
-  const size_t alignment = Metaspace::reserve_alignment();
+  NOT_ZERO(result =
+      (char*) CompressedKlassPointers::reserve_address_space_for_compressed_classes(size, RandomizeClassSpaceLocation,
+                                                                                    optimize_for_zero_base));
 
-  // AArch64: Try to align metaspace class space so that we can decode a
-  // compressed klass with a single MOVK instruction. We can do this iff the
-  // compressed class base is a multiple of 4G.
-  // Additionally, above 32G, ensure the lower LogKlassAlignmentInBytes bits
-  // of the upper 32-bits of the address are zero so we can handle a shift
-  // when decoding.
-
-  // PPC64: smaller heaps up to 2g will be mapped just below 4g. Then the
-  // attempt to place the compressed class space just after the heap fails on
-  // Linux 4.1.42 and higher because the launcher is loaded at 4g
-  // (ELF_ET_DYN_BASE). In that case we reach here and search the address space
-  // below 32g to get a zerobased CCS. For simplicity we reuse the search
-  // strategy for AARCH64.
-
-  static const struct {
-    address from;
-    address to;
-    size_t increment;
-  } search_ranges[] = {
-    {  (address)(4*G),   (address)(32*G),   4*G, },
-    {  (address)(32*G),  (address)(1024*G), (4 << LogKlassAlignmentInBytes) * G },
-    {  nullptr, nullptr, 0 }
-  };
-
-  // Calculate a list of all possible values for the starting address for the
-  // compressed class space.
-  ResourceMark rm;
-  GrowableArray<address> list(36);
-  for (int i = 0; search_ranges[i].from != nullptr; i ++) {
-    address a = search_ranges[i].from;
-    assert(CompressedKlassPointers::is_valid_base(a), "Sanity");
-    while (a < search_ranges[i].to) {
-      list.append(a);
-      a +=  search_ranges[i].increment;
-    }
+  if (result == nullptr) {
+    // Fallback: reserve anywhere
+    log_debug(metaspace, map)("Trying anywhere...");
+    result = os::reserve_memory_aligned(size, Metaspace::reserve_alignment(), false);
   }
 
-  int len = list.length();
-  int r = 0;
-  if (!DumpSharedSpaces) {
-    // Starting from a random position in the list. If the address cannot be reserved
-    // (the OS already assigned it for something else), go to the next position, wrapping
-    // around if necessary, until we exhaust all the items.
-    os::init_random((int)os::javaTimeNanos());
-    r = ABS(os::random()) % len;
-    assert(r >= 0, "must be");
-    log_info(metaspace)("Randomizing compressed class space: start from %d out of %d locations",
-                        r, len);
+  // Wrap resulting range in ReservedSpace
+  ReservedSpace rs;
+  if (result != nullptr) {
+    log_debug(metaspace, map)("Mapped at " PTR_FORMAT, p2i(result));
+    assert(is_aligned(result, Metaspace::reserve_alignment()), "Alignment too small for metaspace");
+    rs = ReservedSpace::space_for_range(result, size, Metaspace::reserve_alignment(),
+                                                      os::vm_page_size(), false, false);
+  } else {
+    log_debug(metaspace, map)("Failed to map.");
+    rs = ReservedSpace();
   }
-  for (int i = 0; i < len; i++) {
-    assert((i + r) >= 0, "should never underflow because len is small integer");
-    address a = list.at((i + r) % len);
-    ReservedSpace rs(size, Metaspace::reserve_alignment(),
-                     os::vm_page_size(), (char*)a);
-    if (rs.is_reserved()) {
-      assert(a == (address)rs.base(), "Sanity");
-      return rs;
-    }
-  }
-#endif // defined(AARCH64) || defined(PPC64)
-
-#ifdef AARCH64
-  // Note: on AARCH64, if the code above does not find any good placement, we
-  // have no recourse. We return an empty space and the VM will exit.
-  return ReservedSpace();
-#else
-  // Default implementation: Just reserve anywhere.
-  return ReservedSpace(size, Metaspace::reserve_alignment(), os::vm_page_size(), (char*)nullptr);
-#endif // AARCH64
+  return rs;
 }
-
 #endif // _LP64
 
 size_t Metaspace::reserve_alignment_words() {
@@ -698,23 +651,41 @@ void Metaspace::ergo_initialize() {
   MaxMetaspaceSize = MAX2(MaxMetaspaceSize, commit_alignment());
 
   if (UseCompressedClassPointers) {
-    // Let CCS size not be larger than 80% of MaxMetaspaceSize. Note that is
+    // Let Class Space not be larger than 80% of MaxMetaspaceSize. Note that is
     // grossly over-dimensioned for most usage scenarios; typical ratio of
     // class space : non class space usage is about 1:6. With many small classes,
     // it can get as low as 1:2. It is not a big deal though since ccs is only
     // reserved and will be committed on demand only.
-    size_t max_ccs_size = MaxMetaspaceSize * 0.8;
-    size_t adjusted_ccs_size = MIN2(CompressedClassSpaceSize, max_ccs_size);
+    const size_t max_ccs_size = 8 * (MaxMetaspaceSize / 10);
+
+    // Sanity check.
+    const size_t max_klass_range = CompressedKlassPointers::max_klass_range_size();
+    assert(max_klass_range >= reserve_alignment(),
+           "Klass range (%zu) must cover at least a full root chunk (%zu)",
+           max_klass_range, reserve_alignment());
+
+    size_t adjusted_ccs_size = MIN3(CompressedClassSpaceSize, max_ccs_size, max_klass_range);
 
     // CCS must be aligned to root chunk size, and be at least the size of one
     //  root chunk.
     adjusted_ccs_size = align_up(adjusted_ccs_size, reserve_alignment());
     adjusted_ccs_size = MAX2(adjusted_ccs_size, reserve_alignment());
 
+    // Print a warning if the adjusted size differs from the users input
+    if (CompressedClassSpaceSize != adjusted_ccs_size) {
+      #define X "CompressedClassSpaceSize adjusted from user input " \
+                "%zu bytes to %zu bytes", CompressedClassSpaceSize, adjusted_ccs_size
+      if (FLAG_IS_CMDLINE(CompressedClassSpaceSize)) {
+        log_warning(metaspace)(X);
+      } else {
+        log_info(metaspace)(X);
+      }
+      #undef X
+    }
+
     // Note: re-adjusting may have us left with a CompressedClassSpaceSize
     //  larger than MaxMetaspaceSize for very small values of MaxMetaspaceSize.
     //  Lets just live with that, its not a big deal.
-
     if (adjusted_ccs_size != CompressedClassSpaceSize) {
       FLAG_SET_ERGO(CompressedClassSpaceSize, adjusted_ccs_size);
       log_info(metaspace)("Setting CompressedClassSpaceSize to " SIZE_FORMAT ".",
@@ -776,14 +747,13 @@ void Metaspace::global_initialize() {
     // case (b) (No CDS)
     ReservedSpace rs;
     const size_t size = align_up(CompressedClassSpaceSize, Metaspace::reserve_alignment());
-    address base = nullptr;
 
     // If CompressedClassSpaceBaseAddress is set, we attempt to force-map class space to
     // the given address. This is a debug-only feature aiding tests. Due to the ASLR lottery
     // this may fail, in which case the VM will exit after printing an appropriate message.
     // Tests using this switch should cope with that.
     if (CompressedClassSpaceBaseAddress != 0) {
-      base = (address)CompressedClassSpaceBaseAddress;
+      const address base = (address)CompressedClassSpaceBaseAddress;
       if (!is_aligned(base, Metaspace::reserve_alignment())) {
         vm_exit_during_initialization(
             err_msg("CompressedClassSpaceBaseAddress=" PTR_FORMAT " invalid "
@@ -801,27 +771,9 @@ void Metaspace::global_initialize() {
       }
     }
 
-    if (!rs.is_reserved()) {
-      // If UseCompressedOops=1 and the java heap has been placed in coops-friendly
-      //  territory, i.e. its base is under 32G, then we attempt to place ccs
-      //  right above the java heap.
-      // Otherwise the lower 32G are still free. We try to place ccs at the lowest
-      // allowed mapping address.
-      base = (UseCompressedOops && (uint64_t)CompressedOops::base() < OopEncodingHeapMax) ?
-              CompressedOops::end() : (address)HeapBaseMinAddress;
-      base = align_up(base, Metaspace::reserve_alignment());
-
-      if (base != nullptr) {
-        if (CompressedKlassPointers::is_valid_base(base)) {
-          rs = ReservedSpace(size, Metaspace::reserve_alignment(),
-                             os::vm_page_size(), (char*)base);
-        }
-      }
-    }
-
     // ...failing that, reserve anywhere, but let platform do optimized placement:
     if (!rs.is_reserved()) {
-      rs = Metaspace::reserve_address_space_for_compressed_classes(size);
+      rs = Metaspace::reserve_address_space_for_compressed_classes(size, true);
     }
 
     // ...failing that, give up.
@@ -838,6 +790,7 @@ void Metaspace::global_initialize() {
     Metaspace::initialize_class_space(rs);
 
     // Set up compressed class pointer encoding.
+    // In CDS=off mode, we give the JVM some leeway to choose a favorable base/shift combination.
     CompressedKlassPointers::initialize((address)rs.base(), rs.size());
   }
 
@@ -890,7 +843,7 @@ size_t Metaspace::max_allocation_word_size() {
 // is suitable for calling from non-Java threads.
 // Callers are responsible for checking null.
 MetaWord* Metaspace::allocate(ClassLoaderData* loader_data, size_t word_size,
-                              MetaspaceObj::Type type) {
+                              MetaspaceObj::Type type, bool use_class_space) {
   assert(word_size <= Metaspace::max_allocation_word_size(),
          "allocation size too large (" SIZE_FORMAT ")", word_size);
 
@@ -900,15 +853,23 @@ MetaWord* Metaspace::allocate(ClassLoaderData* loader_data, size_t word_size,
   // Deal with concurrent unloading failed allocation starvation
   MetaspaceCriticalAllocation::block_if_concurrent_purge();
 
-  MetadataType mdtype = (type == MetaspaceObj::ClassType) ? ClassType : NonClassType;
+  MetadataType mdtype = use_class_space ? ClassType : NonClassType;
 
   // Try to allocate metadata.
   MetaWord* result = loader_data->metaspace_non_null()->allocate(word_size, mdtype);
 
   if (result != nullptr) {
+#ifdef ASSERT
+    if (using_class_space() && mdtype == ClassType) {
+      assert(is_in_class_space(result) &&
+             is_aligned(result, CompressedKlassPointers::klass_alignment_in_bytes()), "Sanity");
+    } else {
+      assert((is_in_class_space(result) || is_in_nonclass_metaspace(result)) &&
+             is_aligned(result, Metaspace::min_allocation_alignment_bytes), "Sanity");
+    }
+#endif
     // Zero initialize.
     Copy::fill_to_words((HeapWord*)result, word_size, 0);
-
     log_trace(metaspace)("Metaspace::allocate: type %d return " PTR_FORMAT ".", (int)type, p2i(result));
   }
 
@@ -916,17 +877,17 @@ MetaWord* Metaspace::allocate(ClassLoaderData* loader_data, size_t word_size,
 }
 
 MetaWord* Metaspace::allocate(ClassLoaderData* loader_data, size_t word_size,
-                              MetaspaceObj::Type type, TRAPS) {
+                              MetaspaceObj::Type type, bool use_class_space, TRAPS) {
 
   if (HAS_PENDING_EXCEPTION) {
     assert(false, "Should not allocate with exception pending");
     return nullptr;  // caller does a CHECK_NULL too
   }
 
-  MetaWord* result = allocate(loader_data, word_size, type);
+  MetaWord* result = allocate(loader_data, word_size, type, use_class_space);
 
   if (result == nullptr) {
-    MetadataType mdtype = (type == MetaspaceObj::ClassType) ? ClassType : NonClassType;
+    MetadataType mdtype = use_class_space ? ClassType : NonClassType;
     tracer()->report_metaspace_allocation_failure(loader_data, word_size, type, mdtype);
 
     // Allocation failed.
@@ -1040,17 +1001,15 @@ void Metaspace::purge(bool classes_unloaded) {
   MetaspaceCriticalAllocation::process();
 }
 
-bool Metaspace::contains(const void* ptr) {
-  if (MetaspaceShared::is_in_shared_metaspace(ptr)) {
-    return true;
-  }
-  return contains_non_shared(ptr);
+
+// Returns true if pointer points into one of the metaspace regions, or
+// into the class space.
+bool Metaspace::is_in_shared_metaspace(const void* ptr) {
+  return MetaspaceShared::is_in_shared_metaspace(ptr);
 }
 
-bool Metaspace::contains_non_shared(const void* ptr) {
-  if (using_class_space() && VirtualSpaceList::vslist_class()->contains((MetaWord*)ptr)) {
-     return true;
-  }
-
+// Returns true if pointer points into one of the non-class-space metaspace regions.
+bool Metaspace::is_in_nonclass_metaspace(const void* ptr) {
   return VirtualSpaceList::vslist_nonclass()->contains((MetaWord*)ptr);
 }
+

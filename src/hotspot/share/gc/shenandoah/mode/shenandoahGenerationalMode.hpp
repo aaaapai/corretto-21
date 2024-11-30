@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2021 THL A29 Limited, a Tencent company. All rights reserved.
+ * Copyright Amazon.com Inc. or its affiliates. All Rights Reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -22,19 +22,18 @@
  *
  */
 
-/*
- * Note: This runs the metaspace utils related parts of gtest in configurations which
- *  are not tested explicitly in the standard gtests.
- *
- */
+#ifndef SHARE_GC_SHENANDOAH_MODE_SHENANDOAHGENERATIONALMODE_HPP
+#define SHARE_GC_SHENANDOAH_MODE_SHENANDOAHGENERATIONALMODE_HPP
 
-/* @test
- * @bug 8264008
- * @summary Run metaspace utils related gtests with compressed class pointers off
- * @requires vm.bits == 64
- * @library /test/lib
- * @modules java.base/jdk.internal.misc
- *          java.xml
- * @requires vm.flagless
- * @run main/native GTestWrapper --gtest_filter=MetaspaceUtils* -XX:-UseCompressedClassPointers
- */
+#include "gc/shenandoah/mode/shenandoahMode.hpp"
+
+class ShenandoahGenerationalMode : public ShenandoahMode {
+public:
+  virtual void initialize_flags() const;
+  virtual const char* name()     { return "Generational"; }
+  virtual bool is_diagnostic()   { return false; }
+  virtual bool is_experimental() { return true; }
+  virtual bool is_generational() { return true; }
+};
+
+#endif // SHARE_GC_SHENANDOAH_MODE_SHENANDOAHGENERATIONALMODE_HPP

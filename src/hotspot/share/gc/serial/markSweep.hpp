@@ -50,7 +50,6 @@ class STWGCTimer;
 // declared at end
 class PreservedMark;
 class MarkAndPushClosure;
-class AdjustPointerClosure;
 
 class MarkSweep : AllStatic {
   //
@@ -84,7 +83,6 @@ class MarkSweep : AllStatic {
   //
   // Friend decls
   //
-  friend class AdjustPointerClosure;
   friend class KeepAliveClosure;
 
   //
@@ -124,8 +122,6 @@ class MarkSweep : AllStatic {
   static MarkAndPushClosure   mark_and_push_closure;
   static FollowStackClosure   follow_stack_closure;
   static CLDToOopClosure      follow_cld_closure;
-  static AdjustPointerClosure adjust_pointer_closure;
-  static CLDToOopClosure      adjust_cld_closure;
 
   // Accessors
   static uint total_invocations() { return _total_invocations; }
@@ -145,12 +141,15 @@ class MarkSweep : AllStatic {
 
   static void follow_stack();   // Empty marking stack.
 
-  template <class T> static inline void adjust_pointer(T* p);
+  template <class T>
+  static void adjust_pointer(T* p);
 
   // Check mark and maybe push on marking stack
   template <class T> static void mark_and_push(T* p);
 
  private:
+  static void adjust_marks_impl();
+
   // Call backs for marking
   static void mark_object(oop obj);
   // Mark pointer and follow contents.  Empty marking stack afterwards.
