@@ -32,16 +32,20 @@
 #include "oops/access.inline.hpp"
 #include "oops/arrayKlass.hpp"
 #include "oops/arrayOop.hpp"
-#include "oops/compressedOops.inline.hpp"
+#include "oops/compressedKlass.inline.hpp"
 #include "oops/instanceKlass.hpp"
-#include "oops/markWord.hpp"
+#include "oops/markWord.inline.hpp"
 #include "oops/oopsHierarchy.hpp"
 #include "runtime/atomic.hpp"
 #include "runtime/globals.hpp"
+#include "runtime/lightweightSynchronizer.hpp"
+#include "runtime/safepoint.hpp"
+#include "runtime/synchronizer.hpp"
 #include "utilities/align.hpp"
 #include "utilities/debug.hpp"
 #include "utilities/macros.hpp"
 #include "utilities/globalDefinitions.hpp"
+#include "logging/log.hpp"
 
 // Implementation of all inlined member functions defined in oop.hpp
 // We need a separate file to avoid circular references
@@ -58,62 +62,148 @@ markWord* oopDesc::mark_addr() const {
   return (markWord*) &_mark;
 }
 
+static void assert_correct_hash_transition(markWord old_mark, markWord new_mark) {
+#ifdef ASSERT
+  if (UseCompactObjectHeaders) {
+    if (new_mark.is_marked()) return; // Install forwardee.
+    if (old_mark.is_forwarded()) return; // Restoration of forwarded object.
+    assert(!(new_mark.hash_is_hashed() && new_mark.hash_is_copied()), "must not be simultaneously hashed and copied state");
+    if (old_mark.hash_is_hashed()) assert(new_mark.hash_is_hashed_or_copied(), "incorrect hash state transition");
+    if (old_mark.hash_is_copied()) assert(new_mark.hash_is_copied(), "incorrect hash state transition, old_mark: " INTPTR_FORMAT ", new_mark: " INTPTR_FORMAT, old_mark.value(), new_mark.value());
+  }
+#endif
+}
+
 void oopDesc::set_mark(markWord m) {
+  assert_correct_hash_transition(mark(), m);
+  if (UseCompactObjectHeaders) {
+    Atomic::store(reinterpret_cast<uint32_t volatile*>(&_mark), m.value32());
+  } else {
+    Atomic::store(&_mark, m);
+  }
+}
+
+void oopDesc::set_mark_full(markWord m) {
+  assert_correct_hash_transition(mark(), m);
   Atomic::store(&_mark, m);
 }
 
 void oopDesc::set_mark(HeapWord* mem, markWord m) {
-  *(markWord*)(((char*)mem) + mark_offset_in_bytes()) = m;
-}
-
-void oopDesc::release_set_mark(HeapWord* mem, markWord m) {
-  Atomic::release_store((markWord*)(((char*)mem) + mark_offset_in_bytes()), m);
+  if (UseCompactObjectHeaders) {
+    assert(!(m.hash_is_hashed() && m.hash_is_copied()), "must not be simultaneously hashed and copied state");
+    *(uint32_t*)(((char*)mem) + mark_offset_in_bytes()) = m.value32();
+  } else {
+    *(markWord*)(((char*)mem) + mark_offset_in_bytes()) = m;
+  }
 }
 
 void oopDesc::release_set_mark(markWord m) {
-  Atomic::release_store(&_mark, m);
+  assert_correct_hash_transition(mark(), m);
+  if (UseCompactObjectHeaders) {
+    Atomic::release_store(reinterpret_cast<uint32_t volatile*>(&_mark), m.value32());
+  } else {
+    Atomic::release_store(&_mark, m);
+  }
+}
+
+void oopDesc::release_set_mark(HeapWord* mem, markWord m) {
+  if (UseCompactObjectHeaders) {
+    assert(!(m.hash_is_hashed() && m.hash_is_copied()), "must not be simultaneously hashed and copied state");
+    Atomic::release_store((uint32_t*)(((char*)mem) + mark_offset_in_bytes()), m.value32());
+  } else {
+    Atomic::release_store((markWord*)(((char*)mem) + mark_offset_in_bytes()), m);
+  }
 }
 
 markWord oopDesc::cas_set_mark(markWord new_mark, markWord old_mark) {
+  assert_correct_hash_transition(old_mark, new_mark);
   return Atomic::cmpxchg(&_mark, old_mark, new_mark);
 }
 
 markWord oopDesc::cas_set_mark(markWord new_mark, markWord old_mark, atomic_memory_order order) {
+  assert_correct_hash_transition(old_mark, new_mark);
   return Atomic::cmpxchg(&_mark, old_mark, new_mark, order);
 }
 
+markWord oopDesc::resolve_mark() const {
+  assert(LockingMode != LM_LEGACY, "Not safe with legacy stack-locking");
+  markWord m = mark();
+  if (m.has_displaced_mark_helper()) {
+    m = m.displaced_mark_helper();
+  }
+  return m;
+}
+
+markWord oopDesc::prototype_mark() const {
+  if (UseCompactObjectHeaders) {
+    return klass()->prototype_header();
+  } else {
+    return markWord::prototype();
+  }
+}
+
 void oopDesc::init_mark() {
-  set_mark(markWord::prototype());
+  if (UseCompactObjectHeaders) {
+    markWord m = prototype_mark().hash_copy_hashctrl_from(mark());
+    //log_info(gc)("Init mark: oop: " PTR_FORMAT ", mark: " INTPTR_FORMAT, p2i(this), m.value());
+    set_mark(m);
+    assert(m.is_neutral(), "must be neutral");
+  } else {
+    set_mark(markWord::prototype());
+  }
 }
 
 Klass* oopDesc::klass() const {
-  if (UseCompressedClassPointers) {
+#ifdef _LP64
+  if (UseCompactObjectHeaders) {
+    markWord m = resolve_mark();
+    return m.klass();
+  } else if (UseCompressedClassPointers) {
     return CompressedKlassPointers::decode_not_null(_metadata._compressed_klass);
-  } else {
+  } else
+#endif
+  {
     return _metadata._klass;
   }
 }
 
 Klass* oopDesc::klass_or_null() const {
-  if (UseCompressedClassPointers) {
+#ifdef _LP64
+  if (UseCompactObjectHeaders) {
+    markWord m = resolve_mark();
+    return m.klass_or_null();
+  } else if (UseCompressedClassPointers) {
     return CompressedKlassPointers::decode(_metadata._compressed_klass);
-  } else {
+  } else
+#endif
+  {
     return _metadata._klass;
   }
 }
 
 Klass* oopDesc::klass_or_null_acquire() const {
-  if (UseCompressedClassPointers) {
-    narrowKlass nklass = Atomic::load_acquire(&_metadata._compressed_klass);
-    return CompressedKlassPointers::decode(nklass);
-  } else {
+#ifdef _LP64
+  if (UseCompactObjectHeaders) {
+    markWord m = mark_acquire();
+    if (m.has_displaced_mark_helper()) {
+      m = m.displaced_mark_helper();
+    }
+    return m.klass_or_null();
+  } else if (UseCompressedClassPointers) {
+     narrowKlass nklass = Atomic::load_acquire(&_metadata._compressed_klass);
+     return CompressedKlassPointers::decode(nklass);
+  } else
+#endif
+  {
     return Atomic::load_acquire(&_metadata._klass);
   }
 }
 
 Klass* oopDesc::klass_raw() const {
-  if (UseCompressedClassPointers) {
-    return CompressedKlassPointers::decode_raw(_metadata._compressed_klass);
+  if (UseCompactObjectHeaders) {
+    return klass();
+  } else if (UseCompressedClassPointers) {
+    return CompressedKlassPointers::decode_without_asserts(_metadata._compressed_klass);
   } else {
     return _metadata._klass;
   }
@@ -121,6 +211,7 @@ Klass* oopDesc::klass_raw() const {
 
 void oopDesc::set_klass(Klass* k) {
   assert(Universe::is_bootstrapping() || (k != nullptr && k->is_klass()), "incorrect Klass");
+  assert(!UseCompactObjectHeaders, "don't set Klass* with compact headers");
   if (UseCompressedClassPointers) {
     _metadata._compressed_klass = CompressedKlassPointers::encode_not_null(k);
   } else {
@@ -130,6 +221,7 @@ void oopDesc::set_klass(Klass* k) {
 
 void oopDesc::release_set_klass(HeapWord* mem, Klass* k) {
   assert(Universe::is_bootstrapping() || (k != nullptr && k->is_klass()), "incorrect Klass");
+  assert(!UseCompactObjectHeaders, "don't set Klass* with compact headers");
   char* raw_mem = ((char*)mem + klass_offset_in_bytes());
   if (UseCompressedClassPointers) {
     Atomic::release_store((narrowKlass*)raw_mem,
@@ -150,10 +242,11 @@ bool oopDesc::is_a(Klass* k) const {
 }
 
 size_t oopDesc::size()  {
-  return size_given_klass(klass());
+  markWord m = UseCompactObjectHeaders ? mark() : markWord::unused_mark();;
+  return size_given_mark_and_klass(m, klass());
 }
 
-size_t oopDesc::size_given_klass(Klass* klass)  {
+size_t oopDesc::base_size_given_klass(const Klass* klass)  {
   int lh = klass->layout_helper();
   size_t s;
 
@@ -200,6 +293,112 @@ size_t oopDesc::size_given_klass(Klass* klass)  {
   assert(s > 0, "Oop size must be greater than zero, not " SIZE_FORMAT, s);
   assert(is_object_aligned(s), "Oop size is not properly aligned: " SIZE_FORMAT, s);
   return s;
+}
+
+size_t oopDesc::size_given_mark_and_klass(markWord mrk, const Klass* kls) {
+  size_t sz = base_size_given_klass(kls);
+  if (UseCompactObjectHeaders) {
+    assert(!mrk.has_displaced_mark_helper(), "must not be displaced");
+    if (mrk.hash_is_copied() && kls->hash_requires_reallocation(cast_to_oop(this))) {
+      log_trace(gc)("Extended size for object: " PTR_FORMAT " base-size: " SIZE_FORMAT ", mark: " PTR_FORMAT, p2i(this), sz, mrk.value());
+      sz = align_object_size(sz + 1);
+    }
+  }
+  return sz;
+}
+size_t oopDesc::copy_size(size_t size, markWord mark) const {
+  if (UseCompactObjectHeaders) {
+    assert(!mark.has_displaced_mark_helper(), "must not be displaced");
+    Klass* klass = mark.klass();
+    if (mark.hash_is_hashed() && klass->hash_requires_reallocation(cast_to_oop(this))) {
+      size = align_object_size(size + 1);
+    }
+  }
+  assert(is_object_aligned(size), "Oop size is not properly aligned: " SIZE_FORMAT, size);
+  return size;
+}
+
+#ifdef _LP64
+markWord oopDesc::forward_safe_mark() const {
+  assert(UseCompactObjectHeaders, "Only get here with compact headers");
+  markWord m = mark();
+  if (m.is_marked()) {
+    oop fwd = forwardee(m);
+    markWord m2 = fwd->mark();
+    assert(!m2.is_forwarded() || m2.is_self_forwarded(), "no double forwarding: this: " PTR_FORMAT " (" INTPTR_FORMAT "), fwd: " PTR_FORMAT " (" INTPTR_FORMAT ")", p2i(this), m.value(), p2i(fwd), m2.value());
+    m = m2;
+  }
+  return m;
+}
+
+Klass* oopDesc::forward_safe_klass_impl(markWord m) const {
+  assert(UseCompactObjectHeaders, "Only get here with compact headers");
+  if (m.is_marked()) {
+    oop fwd = forwardee(m);
+    markWord m2 = fwd->mark();
+    assert(!m2.is_marked() || m2.is_self_forwarded(), "no double forwarding: this: " PTR_FORMAT " (" INTPTR_FORMAT "), fwd: " PTR_FORMAT " (" INTPTR_FORMAT ")", p2i(this), m.value(), p2i(fwd), m2.value());
+    m = m2;
+  }
+  return m.actual_mark().klass();
+}
+#endif
+
+Klass* oopDesc::forward_safe_klass(markWord m) const {
+#ifdef _LP64
+  if (UseCompactObjectHeaders) {
+    return forward_safe_klass_impl(m);
+  } else
+#endif
+  {
+    return klass();
+  }
+}
+
+Klass* oopDesc::forward_safe_klass() const {
+#ifdef _LP64
+  if (UseCompactObjectHeaders) {
+    return forward_safe_klass_impl(mark());
+  } else
+#endif
+  {
+    return klass();
+  }
+}
+
+size_t oopDesc::forward_safe_size() {
+  if (UseCompactObjectHeaders) {
+    markWord orig_mark = mark();
+    markWord fwd_mark = orig_mark;
+    if (orig_mark.is_forwarded()) {
+      fwd_mark = forwardee(orig_mark)->mark();
+    }
+    Klass* klass = forward_safe_klass_impl(fwd_mark);
+    size_t size = size_given_mark_and_klass(fwd_mark, klass);
+    if (orig_mark.is_forward_expanded()) {
+      size -= 1;
+    }
+    return size;
+  } else {
+    return size_given_mark_and_klass(markWord::unused_mark(), klass());
+  }
+}
+
+void oopDesc::forward_safe_init_mark() {
+  if (UseCompactObjectHeaders) {
+    markWord m = mark();
+    bool expanded = m.is_forward_expanded();
+    assert(m.is_forwarded(), "only called when forwarded");
+    m = forwardee(m)->mark();
+    m = m.set_age(0);
+    m = m.set_unlocked();
+    if (expanded) {
+      m = m.hash_set_hashed();
+    }
+    // log_info(gc)("FS Init mark: oop: " PTR_FORMAT ", mark: " INTPTR_FORMAT, p2i(this), m.value());
+    set_mark_full(m);
+  } else {
+    set_mark(markWord::prototype());
+  }
 }
 
 bool oopDesc::is_instance()    const { return klass()->is_instance_klass();             }
@@ -267,24 +466,60 @@ bool oopDesc::is_gc_marked() const {
 bool oopDesc::is_forwarded() const {
   // The extra heap check is needed since the obj might be locked, in which case the
   // mark would point to a stack location and have the sentinel bit cleared
-  return mark().is_marked();
+  return mark().is_forwarded();
+}
+
+bool oopDesc::is_self_forwarded() const {
+  return mark().is_self_forwarded();
 }
 
 // Used by scavengers
-void oopDesc::forward_to(oop p) {
+void oopDesc::forward_to(oop p, bool expanded) {
+  assert(p != cast_to_oop(this), "Must not be called with self-forwarding");
   markWord m = markWord::encode_pointer_as_mark(p);
-  assert(m.decode_pointer() == p, "encoding must be reversible");
-  set_mark(m);
+  if (expanded) {
+    m = m.set_forward_expanded();
+  }
+  assert(forwardee(m) == p, "encoding must be reversible");
+  set_mark_full(m);
+}
+
+void oopDesc::forward_to_self() {
+  set_mark(mark().set_self_forwarded());
+}
+
+oop oopDesc::cas_set_forwardee(markWord new_mark, markWord compare, atomic_memory_order order) {
+  markWord old_mark = cas_set_mark(new_mark, compare, order);
+  if (old_mark == compare) {
+    return nullptr;
+  } else {
+    assert(old_mark.is_forwarded(), "must be forwarded here");
+    return forwardee(old_mark);
+  }
 }
 
 oop oopDesc::forward_to_atomic(oop p, markWord compare, atomic_memory_order order) {
   markWord m = markWord::encode_pointer_as_mark(p);
-  assert(m.decode_pointer() == p, "encoding must be reversible");
-  markWord old_mark = cas_set_mark(m, compare, order);
-  if (old_mark == compare) {
-    return nullptr;
+  assert(forwardee(m) == p, "encoding must be reversible");
+  return cas_set_forwardee(m, compare, order);
+}
+
+oop oopDesc::forward_to_self_atomic(markWord old_mark, atomic_memory_order order) {
+  markWord new_mark = old_mark.set_self_forwarded();
+  assert(forwardee(new_mark) == cast_to_oop(this), "encoding must be reversible");
+  // Note: It is ok, and even necessary, to CAS the full 64 bit, even though only
+  // the lowest 32 bits are modified. This happens during a safepoint, therefore
+  // the object beyond the header should not change. And we need the full
+  // 64 bit to capture the forwarding pointer in case of CAS failure.
+  return cas_set_forwardee(new_mark, old_mark, order);
+}
+
+oop oopDesc::forwardee(markWord mark) const {
+  assert(mark.is_forwarded(), "only decode when actually forwarded");
+  if (mark.is_self_forwarded()) {
+    return cast_to_oop(this);
   } else {
-    return cast_to_oop(old_mark.decode_pointer());
+    return mark.forwardee();
   }
 }
 
@@ -292,8 +527,11 @@ oop oopDesc::forward_to_atomic(oop p, markWord compare, atomic_memory_order orde
 // The forwardee is used when copying during scavenge and mark-sweep.
 // It does need to clear the low two locking- and GC-related bits.
 oop oopDesc::forwardee() const {
-  assert(is_forwarded(), "only decode when actually forwarded");
-  return cast_to_oop(mark().decode_pointer());
+  return forwardee(mark());
+}
+
+void oopDesc::unset_self_forwarded() {
+  set_mark(mark().unset_self_forwarded());
 }
 
 // The following method needs to be MT safe.
@@ -327,16 +565,19 @@ void oopDesc::oop_iterate(OopClosureType* cl, MemRegion mr) {
 
 template <typename OopClosureType>
 size_t oopDesc::oop_iterate_size(OopClosureType* cl) {
+  markWord m = UseCompactObjectHeaders ? mark() : markWord::unused_mark();
+  assert((!UseCompactObjectHeaders) || m.narrow_klass() != 0, "null narrowKlass: " INTPTR_FORMAT, m.value());
   Klass* k = klass();
-  size_t size = size_given_klass(k);
+  size_t size = size_given_mark_and_klass(m, k);
   OopIteratorClosureDispatch::oop_oop_iterate(cl, this, k);
   return size;
 }
 
 template <typename OopClosureType>
 size_t oopDesc::oop_iterate_size(OopClosureType* cl, MemRegion mr) {
+  markWord m = UseCompactObjectHeaders ? mark() : markWord::unused_mark();
   Klass* k = klass();
-  size_t size = size_given_klass(k);
+  size_t size = size_given_mark_and_klass(m, k);
   OopIteratorClosureDispatch::oop_oop_iterate(cl, this, k, mr);
   return size;
 }
@@ -348,7 +589,8 @@ void oopDesc::oop_iterate_backwards(OopClosureType* cl) {
 
 template <typename OopClosureType>
 void oopDesc::oop_iterate_backwards(OopClosureType* cl, Klass* k) {
-  assert(k == klass(), "wrong klass");
+  // In this assert, we cannot safely access the Klass* with compact headers.
+  assert(UseCompactObjectHeaders || k == klass(), "wrong klass");
   OopIteratorClosureDispatch::oop_oop_iterate_backwards(cl, this, k);
 }
 
@@ -359,14 +601,23 @@ bool oopDesc::is_instanceof_or_null(oop obj, Klass* klass) {
 intptr_t oopDesc::identity_hash() {
   // Fast case; if the object is unlocked and the hash value is set, no locking is needed
   // Note: The mark must be read into local variable to avoid concurrent updates.
-  markWord mrk = mark();
-  if (mrk.is_unlocked() && !mrk.has_no_hash()) {
-    return mrk.hash();
-  } else if (mrk.is_marked()) {
-    return mrk.hash();
+  if (UseCompactObjectHeaders) {
+    markWord mrk = mark();
+    if (mrk.hash_is_copied()) {
+      Klass* klass = mrk.klass();
+      return int_field(klass->hash_offset_in_bytes(cast_to_oop(this)));
+    }
+    // Fall-through to slow-case.
   } else {
-    return slow_identity_hash();
+    markWord mrk = mark();
+    if (mrk.is_unlocked() && !mrk.has_no_hash()) {
+      return mrk.hash();
+    } else if (mrk.is_marked()) {
+      return mrk.hash();
+    }
+    // Fall-through to slow-case.
   }
+  return slow_identity_hash();
 }
 
 // This checks fast simple case of whether the oop has_no_hash,
@@ -395,6 +646,37 @@ bool oopDesc::mark_must_be_preserved() const {
 
 bool oopDesc::mark_must_be_preserved(markWord m) const {
   return m.must_be_preserved(this);
+}
+
+
+void oopDesc::initialize_hash_if_necessary(oop obj, Klass* k, markWord m) {
+  assert(UseCompactObjectHeaders, "only with compact headers");
+  assert(!m.has_displaced_mark_helper(), "must not be displaced header");
+  assert(m.hash_is_hashed(), "must hashed");
+  assert(!m.hash_is_copied(), "must not be installed");
+  uint32_t hash = static_cast<uint32_t>(ObjectSynchronizer::get_next_hash(nullptr, obj));
+  int offset = k->hash_offset_in_bytes(cast_to_oop(this));
+  assert(offset >= 4, "hash offset must not be in header");
+  //log_info(gc)("Initializing hash for " PTR_FORMAT ", old: " PTR_FORMAT ", hash: %d, offset: %d", p2i(this), p2i(obj), hash, offset);
+  int_field_put(offset, (jint)hash);
+  m = m.hash_set_copied();
+  assert(static_cast<uint32_t>(LightweightSynchronizer::get_hash(m, cast_to_oop(this), k)) == hash, "hash must remain the same");
+  set_mark(m);
+}
+
+bool oopDesc::initialize_hash_if_necessary(oop obj) {
+  if (!UseCompactObjectHeaders) {
+    return false;
+  }
+  markWord m = mark();
+  assert(!m.has_displaced_mark_helper(), "must not be displaced header");
+  if (m.hash_is_hashed()) {
+    assert(!m.hash_is_copied(), "must not be installed, mark: " INTPTR_FORMAT, m.value());
+    Klass* k = m.klass();
+    initialize_hash_if_necessary(obj, k, m);
+    return true;
+  }
+  return false;
 }
 
 #endif // SHARE_OOPS_OOP_INLINE_HPP

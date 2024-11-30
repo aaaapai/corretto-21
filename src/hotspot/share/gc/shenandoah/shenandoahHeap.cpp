@@ -35,6 +35,7 @@
 #include "gc/shared/locationPrinter.inline.hpp"
 #include "gc/shared/memAllocator.hpp"
 #include "gc/shared/plab.hpp"
+#include "gc/shared/slidingForwarding.hpp"
 #include "gc/shared/tlab_globals.hpp"
 
 #include "gc/shenandoah/heuristics/shenandoahOldHeuristics.hpp"
@@ -455,6 +456,8 @@ jint ShenandoahHeap::initialize() {
   initialize_controller();
 
   print_init_logger();
+
+  SlidingForwarding::initialize(_heap_region, ShenandoahHeapRegion::region_size_words());
 
   return JNI_OK;
 }

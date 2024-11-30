@@ -1,5 +1,5 @@
 [general]
-project=shenandoah
+project=lilliput
 jbs=JDK
 version=21.0.6
 

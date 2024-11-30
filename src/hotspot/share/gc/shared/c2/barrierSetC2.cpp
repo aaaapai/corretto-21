@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2018, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -653,7 +653,7 @@ int BarrierSetC2::arraycopy_payload_base_offset(bool is_array) {
   int base_off = is_array ? arrayOopDesc::length_offset_in_bytes() :
                             instanceOopDesc::base_offset_in_bytes();
   // base_off:
-  // 8  - 32-bit VM
+  // 8  - 32-bit VM or 64-bit VM, compact headers
   // 12 - 64-bit VM, compressed klass
   // 16 - 64-bit VM, normal klass
   if (base_off % BytesPerLong != 0) {
@@ -662,10 +662,14 @@ int BarrierSetC2::arraycopy_payload_base_offset(bool is_array) {
       // Exclude length to copy by 8 bytes words.
       base_off += sizeof(int);
     } else {
-      // Include klass to copy by 8 bytes words.
-      base_off = instanceOopDesc::klass_offset_in_bytes();
+      if (UseCompactObjectHeaders) {
+        base_off = 0; /* FIXME */
+      } else {
+        // Include klass to copy by 8 bytes words.
+        base_off = instanceOopDesc::klass_offset_in_bytes();
+      }
     }
-    assert(base_off % BytesPerLong == 0, "expect 8 bytes alignment");
+    assert(base_off % BytesPerLong == 0 || UseCompactObjectHeaders, "expect 8 bytes alignment");
   }
   return base_off;
 }

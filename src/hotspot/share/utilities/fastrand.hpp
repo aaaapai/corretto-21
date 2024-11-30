@@ -1,5 +1,6 @@
 /*
- * Copyright (C) 2021 THL A29 Limited, a Tencent company. All rights reserved.
+ * Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2023, Red Hat, Inc. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -22,19 +23,25 @@
  *
  */
 
-/*
- * Note: This runs the metaspace utils related parts of gtest in configurations which
- *  are not tested explicitly in the standard gtests.
- *
- */
+#ifndef SHARE_UTILITIES_FASTRAND_HPP
+#define SHARE_UTILITIES_FASTRAND_HPP
 
-/* @test
- * @bug 8264008
- * @summary Run metaspace utils related gtests with compressed class pointers off
- * @requires vm.bits == 64
- * @library /test/lib
- * @modules java.base/jdk.internal.misc
- *          java.xml
- * @requires vm.flagless
- * @run main/native GTestWrapper --gtest_filter=MetaspaceUtils* -XX:-UseCompressedClassPointers
- */
+#include "runtime/os.hpp"
+#include "utilities/globalDefinitions.hpp"
+
+// Simple utility class to generate random numbers for use in a single-threaded
+// context. Since os::random() needs to update the global seed, this is faster
+// when used on within a single thread.
+// Seed initialization happens, similar to os::init_random(), via os::javaTimeNanos());
+
+class FastRandom {
+  unsigned _seed;
+  public:
+  FastRandom () : _seed((unsigned) os::javaTimeNanos()) {}
+  unsigned next() {
+    _seed = os::next_random(_seed);
+    return _seed;
+  }
+};
+
+#endif // SHARE_UTILITIES_FASTRAND_HPP

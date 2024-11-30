@@ -345,18 +345,13 @@ uint ShenandoahHeap::get_object_age(oop obj) {
   return w.age();
 }
 
-bool ShenandoahHeap::is_in(const void* p) const {
-  HeapWord* heap_base = (HeapWord*) base();
-  HeapWord* last_region_end = heap_base + ShenandoahHeapRegion::region_size_words() * num_regions();
-  return p >= heap_base && p < last_region_end;
-}
-
-inline bool ShenandoahHeap::is_in_active_generation(oop obj) const {
-  if (!mode()->is_generational()) {
-    // everything is the same single generation
-    assert(is_in(obj), "Otherwise shouldn't return true below");
-    return true;
+  markWord mark = p->mark();
+  if (ShenandoahForwarding::is_forwarded(mark)) {
+    return ShenandoahForwarding::get_forwardee(p);
   }
+  size_t old_size = ShenandoahForwarding::object_size(p);
+  size_t size = p->copy_size(old_size, mark);
+  assert(!heap_region_containing(p)->is_humongous(), "never evacuate humongous objects");
 
   ShenandoahGeneration* const gen = active_generation();
 
@@ -403,28 +398,53 @@ inline bool ShenandoahHeap::is_old(oop obj) const {
   return active_generation()->is_young() && is_in_old(obj);
 }
 
-inline ShenandoahAffiliation ShenandoahHeap::region_affiliation(const ShenandoahHeapRegion *r) {
-  return (ShenandoahAffiliation) _affiliations[r->index()];
-}
+  // Copy the object:
+  Copy::aligned_disjoint_words(cast_from_oop<HeapWord*>(p), copy, old_size);
+  oop copy_val = cast_to_oop(copy);
 
-inline void ShenandoahHeap::assert_lock_for_affiliation(ShenandoahAffiliation orig_affiliation,
-                                                        ShenandoahAffiliation new_affiliation) {
-  // A lock is required when changing from FREE to NON-FREE.  Though it may be possible to elide the lock when
-  // transitioning from in-use to FREE, the current implementation uses a lock for this transition.  A lock is
-  // not required to change from YOUNG to OLD (i.e. when promoting humongous region).
-  //
-  //         new_affiliation is:     FREE   YOUNG   OLD
-  //  orig_affiliation is:  FREE      X       L      L
-  //                       YOUNG      L       X
-  //                         OLD      L       X      X
-  //  X means state transition won't happen (so don't care)
-  //  L means lock should be held
-  //  Blank means no lock required because affiliation visibility will not be required until subsequent safepoint
-  //
-  // Note: during full GC, all transitions between states are possible.  During Full GC, we should be in a safepoint.
+  if (UseCompactObjectHeaders) {
+    // The copy above is not atomic. Make sure we have seen the proper mark
+    // and re-install it into the copy, so that Klass* is guaranteed to be correct.
+    markWord mark = copy_val->mark();
+    if (!mark.is_marked()) {
+      copy_val->set_mark(mark);
+      copy_val->initialize_hash_if_necessary(p);
+      ContinuationGCSupport::relativize_stack_chunk(copy_val);
+    } else {
+      // If we copied a mark-word that indicates 'forwarded' state, the object
+      // installation would not succeed. We cannot access Klass* anymore either.
+      // Skip the transformation.
+    }
+  } else {
+    ContinuationGCSupport::relativize_stack_chunk(copy_val);
+  }
 
-  if ((orig_affiliation == ShenandoahAffiliation::FREE) || (new_affiliation == ShenandoahAffiliation::FREE)) {
-    shenandoah_assert_heaplocked_or_safepoint();
+  // Try to install the new forwarding pointer.
+  oop result = ShenandoahForwarding::try_update_forwardee(p, copy_val);
+  if (result == copy_val) {
+    // Successfully evacuated. Our copy is now the public one!
+    shenandoah_assert_correct(nullptr, copy_val);
+    return copy_val;
+  }  else {
+    // Failed to evacuate. We need to deal with the object that is left behind. Since this
+    // new allocation is certainly after TAMS, it will be considered live in the next cycle.
+    // But if it happens to contain references to evacuated regions, those references would
+    // not get updated for this stale copy during this cycle, and we will crash while scanning
+    // it the next cycle.
+    //
+    // For GCLAB allocations, it is enough to rollback the allocation ptr. Either the next
+    // object will overwrite this stale copy, or the filler object on LAB retirement will
+    // do this. For non-GCLAB allocations, we have no way to retract the allocation, and
+    // have to explicitly overwrite the copy with the filler object. With that overwrite,
+    // we have to keep the fwdptr initialized and pointing to our (stale) copy.
+    if (alloc_from_gclab) {
+      ShenandoahThreadLocalData::gclab(thread)->undo_allocation(copy, size);
+    } else {
+      fill_with_object(copy, size);
+      shenandoah_assert_correct(nullptr, copy_val);
+    }
+    shenandoah_assert_correct(nullptr, result);
+    return result;
   }
 }
 
@@ -593,7 +613,8 @@ inline void ShenandoahHeap::marked_object_iterate(ShenandoahHeapRegion* region, 
     oop obj = cast_to_oop(cs);
     assert(oopDesc::is_oop(obj), "sanity");
     assert(ctx->is_marked(obj), "object expected to be marked");
-    size_t size = obj->size();
+    assert(!is_full_gc_in_progress(), "No size-based iteration in full-GC");
+    size_t size = ShenandoahForwarding::object_size(obj);
     cl->do_object(obj);
     cs += size;
   }

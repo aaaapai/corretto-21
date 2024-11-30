@@ -25,7 +25,7 @@
 package gc.stress.systemgc;
 
 /*
- * @test TestSystemGCWithG1
+ * @test id=default
  * @key stress
  * @bug 8190703
  * @library /

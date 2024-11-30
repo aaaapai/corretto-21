@@ -25,6 +25,7 @@
 #ifndef SHARE_OOPS_INSTANCEKLASS_HPP
 #define SHARE_OOPS_INSTANCEKLASS_HPP
 
+#include "memory/allocation.hpp"
 #include "memory/referenceType.hpp"
 #include "oops/annotations.hpp"
 #include "oops/constMethod.hpp"
@@ -141,6 +142,8 @@ class InstanceKlass: public Klass {
  protected:
   InstanceKlass(const ClassFileParser& parser, KlassKind kind = Kind, ReferenceType reference_type = REF_NONE);
 
+  void* operator new(size_t size, ClassLoaderData* loader_data, size_t word_size, bool use_class_space, TRAPS) throw();
+
  public:
   InstanceKlass() { assert(DumpSharedSpaces || UseSharedSpaces, "only for CDS"); }
 
@@ -237,6 +240,8 @@ class InstanceKlass: public Klass {
   InstanceKlassFlags _misc_flags;
 
   JavaThread* volatile _init_thread;        // Pointer to current thread doing initialization (to handle recursive initialization)
+
+  int             _hash_offset;             // Offset of hidden field for i-hash
 
   OopMapCache*    volatile _oop_map_cache;   // OopMapCache for all methods in the klass (allocated lazily)
   JNIid*          _jni_ids;              // First JNI identifier for static fields in this class
@@ -953,6 +958,15 @@ public:
   // Use this to return the size of an instance in heap words:
   int size_helper() const {
     return layout_helper_to_size_helper(layout_helper());
+  }
+
+  virtual int hash_offset_in_bytes(oop obj) const {
+    assert(UseCompactObjectHeaders, "only with compact i-hash");
+    return _hash_offset;
+  }
+  static int hash_offset_offset_in_bytes() {
+    assert(UseCompactObjectHeaders, "only with compact i-hash");
+    return (int)offset_of(InstanceKlass, _hash_offset);
   }
 
   // This bit is initialized in classFileParser.cpp.

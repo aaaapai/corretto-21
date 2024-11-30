@@ -26,8 +26,10 @@
 #include "precompiled.hpp"
 #include "memory/metaspace/chunkManager.hpp"
 #include "memory/metaspace/counters.hpp"
+#include "memory/metaspace/metablock.hpp"
 #include "memory/metaspace/metaspaceArena.hpp"
 #include "memory/metaspace/metaspaceArenaGrowthPolicy.hpp"
+#include "memory/metaspace/metaspaceContext.hpp"
 #include "memory/metaspace/metaspaceSettings.hpp"
 #include "memory/metaspace/metaspaceStatistics.hpp"
 #include "runtime/mutexLocker.hpp"
@@ -38,11 +40,14 @@
 #include "metaspaceGtestContexts.hpp"
 #include "metaspaceGtestSparseArray.hpp"
 
+using metaspace::AllocationAlignmentByteSize;
 using metaspace::ArenaGrowthPolicy;
 using metaspace::ChunkManager;
 using metaspace::IntCounter;
 using metaspace::MemRangeCounter;
+using metaspace::MetaBlock;
 using metaspace::MetaspaceArena;
+using metaspace::MetaspaceContext;
 using metaspace::SizeAtomicCounter;
 using metaspace::ArenaStats;
 using metaspace::InUseChunkStats;
@@ -52,18 +57,11 @@ static bool fifty_fifty() {
   return IntRange(100).random_value() < 50;
 }
 
-// See metaspaceArena.cpp : needed for predicting commit sizes.
-namespace metaspace {
-  extern size_t get_raw_word_size_for_requested_word_size(size_t net_word_size);
-}
-
 // A MetaspaceArenaTestBed contains a single MetaspaceArena and its lock.
 // It keeps track of allocations done from this MetaspaceArena.
 class MetaspaceArenaTestBed : public CHeapObj<mtInternal> {
 
   MetaspaceArena* _arena;
-
-  Mutex* _lock;
 
   const SizeRange _allocation_range;
   size_t _size_of_last_failed_allocation;
@@ -132,21 +130,14 @@ public:
 
   MetaspaceArena* arena() { return _arena; }
 
-  MetaspaceArenaTestBed(ChunkManager* cm, const ArenaGrowthPolicy* alloc_sequence,
-                        SizeAtomicCounter* used_words_counter, SizeRange allocation_range) :
-    _arena(NULL),
-    _lock(NULL),
-    _allocation_range(allocation_range),
-    _size_of_last_failed_allocation(0),
-    _allocations(NULL),
-    _alloc_count(),
-    _dealloc_count()
+  MetaspaceArenaTestBed(MetaspaceContext* context, const ArenaGrowthPolicy* growth_policy,
+                        size_t allocation_alignment_words, SizeRange allocation_range)
+    : _arena(nullptr)
+    , _allocation_range(allocation_range)
+    , _size_of_last_failed_allocation(0)
+    , _allocations(nullptr)
   {
-    _lock = new Mutex(Monitor::nosafepoint, "gtest-MetaspaceArenaTestBed_lock");
-    // Lock during space creation, since this is what happens in the VM too
-    //  (see ClassLoaderData::metaspace_non_null(), which we mimick here).
-    MutexLocker ml(_lock,  Mutex::_no_safepoint_check_flag);
-    _arena = new MetaspaceArena(cm, alloc_sequence, _lock, used_words_counter, "gtest-MetaspaceArenaTestBed-sm");
+    _arena = new MetaspaceArena(context, growth_policy, Metaspace::min_allocation_alignment_words, "gtest-MetaspaceArenaTestBed-sm");
   }
 
   ~MetaspaceArenaTestBed() {
@@ -165,7 +156,6 @@ public:
 
     // Delete MetaspaceArena. That should clean up all metaspace.
     delete _arena;
-    delete _lock;
 
   }
 
@@ -177,12 +167,20 @@ public:
   // Allocate a random amount. Return false if the allocation failed.
   bool checked_random_allocate() {
     size_t word_size = 1 + _allocation_range.random_value();
-    MetaWord* p = _arena->allocate(word_size);
-    if (p != NULL) {
-      EXPECT_TRUE(is_aligned(p, sizeof(MetaWord)));
+    MetaBlock wastage;
+    MetaBlock bl = _arena->allocate(word_size, wastage);
+    // We only expect wastage if either alignment was not met or the chunk remainder
+    // was not large enough.
+    if (wastage.is_nonempty()) {
+      _arena->deallocate(wastage);
+      wastage.reset();
+    }
+    if (bl.is_nonempty()) {
+      EXPECT_TRUE(is_aligned(bl.base(), AllocationAlignmentByteSize));
+
       allocation_t* a = NEW_C_HEAP_OBJ(allocation_t, mtInternal);
       a->word_size = word_size;
-      a->p = p;
+      a->p = bl.base();
       a->mark();
       a->next = _allocations;
       _allocations = a;
@@ -206,7 +204,7 @@ public:
     }
     if (a != NULL && a->p != NULL) {
       a->verify();
-      _arena->deallocate(a->p, a->word_size);
+      _arena->deallocate(MetaBlock(a->p, a->word_size));
       _dealloc_count.add(a->word_size);
       a->p = NULL; a->word_size = 0;
       if ((_dealloc_count.count() % 20) == 0) {
@@ -231,8 +229,8 @@ class MetaspaceArenaTest {
 
   void create_new_test_bed_at(int slotindex, const ArenaGrowthPolicy* growth_policy, SizeRange allocation_range) {
     DEBUG_ONLY(_testbeds.check_slot_is_null(slotindex));
-    MetaspaceArenaTestBed* bed = new MetaspaceArenaTestBed(&_context.cm(), growth_policy,
-                                                       &_used_words_counter, allocation_range);
+    MetaspaceArenaTestBed* bed = new MetaspaceArenaTestBed(_context.context(), growth_policy,
+        Metaspace::min_allocation_alignment_words, allocation_range);
     _testbeds.set_at(slotindex, bed);
     _num_beds.increment();
   }

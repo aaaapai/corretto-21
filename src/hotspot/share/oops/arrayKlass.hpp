@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1997, 2022, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1997, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -47,6 +47,8 @@ class ArrayKlass: public Klass {
   // initialization, the other is a dummy
   ArrayKlass(Symbol* name, KlassKind kind);
   ArrayKlass() { assert(DumpSharedSpaces || UseSharedSpaces, "only for cds"); }
+
+  void* operator new(size_t size, ClassLoaderData* loader_data, size_t word_size, TRAPS) throw();
 
  public:
   // Testing operation
@@ -110,6 +112,8 @@ class ArrayKlass: public Klass {
 
   // jvm support
   jint compute_modifier_flags() const;
+
+  int hash_offset_in_bytes(oop obj) const;
 
   // JVMTI support
   jint jvmti_class_status() const;

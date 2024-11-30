@@ -60,7 +60,6 @@ MarkSweep::FollowRootClosure  MarkSweep::follow_root_closure;
 
 MarkAndPushClosure MarkSweep::mark_and_push_closure(ClassLoaderData::_claim_stw_fullgc_mark);
 CLDToOopClosure    MarkSweep::follow_cld_closure(&mark_and_push_closure, ClassLoaderData::_claim_stw_fullgc_mark);
-CLDToOopClosure    MarkSweep::adjust_cld_closure(&adjust_pointer_closure, ClassLoaderData::_claim_stw_fullgc_adjust);
 
 template <class T> void MarkSweep::KeepAliveClosure::do_oop_work(T* p) {
   mark_and_push(p);
@@ -147,7 +146,7 @@ void PreservedMark::adjust_pointer() {
 }
 
 void PreservedMark::restore() {
-  _obj->set_mark(_mark);
+  _obj->set_mark(_mark.hash_copy_hashctrl_from(_obj->mark()));
 }
 
 // We preserve the mark which should be replaced at the end and the location
@@ -172,13 +171,18 @@ void MarkSweep::mark_object(oop obj) {
     _string_dedup_requests->add(obj);
   }
 
+  // Do the transform while we still have the header intact,
+  // which might include important class information.
+  ContinuationGCSupport::transform_stack_chunk(obj);
+
   // some marks may contain information we need to preserve so we store them away
   // and overwrite the mark.  We'll restore it at the end of markSweep.
   markWord mark = obj->mark();
-  obj->set_mark(markWord::prototype().set_marked());
-
-  ContinuationGCSupport::transform_stack_chunk(obj);
-
+  if (UseCompactObjectHeaders) {
+    obj->set_mark(obj->mark().set_marked());
+  } else {
+    obj->set_mark(obj->prototype_mark().set_marked());
+  }
   if (obj->mark_must_be_preserved(mark)) {
     preserve_mark(obj, mark);
   }
@@ -200,9 +204,7 @@ void MarkAndPushClosure::do_oop_work(T* p)            { MarkSweep::mark_and_push
 void MarkAndPushClosure::do_oop(      oop* p)         { do_oop_work(p); }
 void MarkAndPushClosure::do_oop(narrowOop* p)         { do_oop_work(p); }
 
-AdjustPointerClosure MarkSweep::adjust_pointer_closure;
-
-void MarkSweep::adjust_marks() {
+void MarkSweep::adjust_marks_impl() {
   // adjust the oops we saved earlier
   for (size_t i = 0; i < _preserved_count; i++) {
     _preserved_marks[i].adjust_pointer();
@@ -214,6 +216,10 @@ void MarkSweep::adjust_marks() {
     PreservedMark* p = iter.next_addr();
     p->adjust_pointer();
   }
+}
+
+void MarkSweep::adjust_marks() {
+  adjust_marks_impl();
 }
 
 void MarkSweep::restore_marks() {

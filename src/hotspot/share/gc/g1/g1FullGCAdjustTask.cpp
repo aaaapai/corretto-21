@@ -62,6 +62,11 @@ class G1AdjustRegionClosure : public HeapRegionClosure {
     _worker_id(worker_id) { }
 
   bool do_heap_region(HeapRegion* r) {
+    return do_heap_region_impl(r);
+  }
+
+private:
+  bool do_heap_region_impl(HeapRegion* r) {
     G1AdjustClosure cl(_collector);
     if (r->is_humongous()) {
       // Special handling for humongous regions to get somewhat better
@@ -81,12 +86,11 @@ G1FullGCAdjustTask::G1FullGCAdjustTask(G1FullCollector* collector) :
     G1FullGCTask("G1 Adjust", collector),
     _root_processor(G1CollectedHeap::heap(), collector->workers()),
     _weak_proc_task(collector->workers()),
-    _hrclaimer(collector->workers()),
-    _adjust(collector) {
+    _hrclaimer(collector->workers()) {
   ClassLoaderDataGraph::verify_claimed_marks_cleared(ClassLoaderData::_claim_stw_fullgc_adjust);
 }
 
-void G1FullGCAdjustTask::work(uint worker_id) {
+void G1FullGCAdjustTask::work_impl(uint worker_id) {
   Ticks start = Ticks::now();
   ResourceMark rm;
 
@@ -94,18 +98,23 @@ void G1FullGCAdjustTask::work(uint worker_id) {
   G1FullGCMarker* marker = collector()->marker(worker_id);
   marker->preserved_stack()->adjust_during_full_gc();
 
+  G1AdjustClosure adjust(collector());
   {
     // Adjust the weak roots.
     AlwaysTrueClosure always_alive;
-    _weak_proc_task.work(worker_id, &always_alive, &_adjust);
+    _weak_proc_task.work(worker_id, &always_alive, &adjust);
   }
 
-  CLDToOopClosure adjust_cld(&_adjust, ClassLoaderData::_claim_stw_fullgc_adjust);
-  CodeBlobToOopClosure adjust_code(&_adjust, CodeBlobToOopClosure::FixRelocations);
-  _root_processor.process_all_roots(&_adjust, &adjust_cld, &adjust_code);
+  CLDToOopClosure adjust_cld(&adjust, ClassLoaderData::_claim_stw_fullgc_adjust);
+  CodeBlobToOopClosure adjust_code(&adjust, CodeBlobToOopClosure::FixRelocations);
+  _root_processor.process_all_roots(&adjust, &adjust_cld, &adjust_code);
 
   // Now adjust pointers region by region
   G1AdjustRegionClosure blk(collector(), worker_id);
   G1CollectedHeap::heap()->heap_region_par_iterate_from_worker_offset(&blk, &_hrclaimer, worker_id);
   log_task("Adjust task", worker_id, start);
+}
+
+void G1FullGCAdjustTask::work(uint worker_id) {
+  work_impl(worker_id);
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2020, 2024, Oracle and/or its affiliates. All rights reserved.
  * Copyright (c) 2020, 2021 SAP SE. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
@@ -24,6 +24,7 @@
  */
 
 #include "precompiled.hpp"
+#include "memory/metaspace/chunkManager.hpp"
 #include "memory/metaspace/metaspaceArena.hpp"
 #include "memory/metaspace/metaspaceArenaGrowthPolicy.hpp"
 #include "memory/metaspace/metaspaceContext.hpp"
@@ -44,16 +45,26 @@ MetaspaceTestArena::MetaspaceTestArena(Mutex* lock, MetaspaceArena* arena) :
 {}
 
 MetaspaceTestArena::~MetaspaceTestArena() {
-  delete _arena;
+  {
+    MutexLocker fcl(_lock, Mutex::_no_safepoint_check_flag);
+    delete _arena;
+  }
   delete _lock;
 }
 
 MetaWord* MetaspaceTestArena::allocate(size_t word_size) {
-  return _arena->allocate(word_size);
+  MutexLocker fcl(_lock, Mutex::_no_safepoint_check_flag);
+  MetaBlock result, wastage;
+  result = _arena->allocate(word_size, wastage);
+  if (wastage.is_nonempty()) {
+    _arena->deallocate(wastage);
+  }
+  return result.base();
 }
 
 void MetaspaceTestArena::deallocate(MetaWord* p, size_t word_size) {
-  return _arena->deallocate(p, word_size);
+  MutexLocker fcl(_lock, Mutex::_no_safepoint_check_flag);
+  _arena->deallocate(MetaBlock(p, word_size));
 }
 
 ///// MetaspaceTestArea //////
@@ -64,7 +75,6 @@ MetaspaceTestContext::MetaspaceTestContext(const char* name, size_t commit_limit
   _commit_limit(commit_limit),
   _context(nullptr),
   _commit_limiter(commit_limit == 0 ? max_uintx : commit_limit), // commit_limit == 0 -> no limit
-  _used_words_counter(),
   _rs()
 {
   assert(is_aligned(reserve_limit, Metaspace::reserve_alignment_words()), "reserve_limit (" SIZE_FORMAT ") "
@@ -97,7 +107,7 @@ MetaspaceTestArena* MetaspaceTestContext::create_arena(Metaspace::MetaspaceType 
   MetaspaceArena* arena = nullptr;
   {
     MutexLocker ml(lock,  Mutex::_no_safepoint_check_flag);
-    arena = new MetaspaceArena(_context->cm(), growth_policy, lock, &_used_words_counter, _name);
+    arena = new MetaspaceArena(_context, growth_policy, Metaspace::min_allocation_alignment_words, _name);
   }
   return new MetaspaceTestArena(lock, arena);
 }
@@ -116,6 +126,19 @@ void MetaspaceTestContext::verify() const {
 
 void MetaspaceTestContext::print_on(outputStream* st) const {
   _context->print_on(st);
+}
+
+size_t MetaspaceTestContext::used_words() const {
+  return _context->used_words_counter()->get();
+}
+
+size_t MetaspaceTestContext::committed_words() const {
+  assert(_commit_limiter.committed_words() == _context->committed_words(), "Sanity");
+  return _context->committed_words();
+}
+
+size_t MetaspaceTestContext::reserved_words() const {
+  return _context->reserved_words();
 }
 
 } // namespace metaspace

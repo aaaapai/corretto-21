@@ -187,8 +187,21 @@ Method* Klass::uncached_lookup_method(const Symbol* name, const Symbol* signatur
   return nullptr;
 }
 
-void* Klass::operator new(size_t size, ClassLoaderData* loader_data, size_t word_size, TRAPS) throw() {
-  return Metaspace::allocate(loader_data, word_size, MetaspaceObj::ClassType, THREAD);
+static markWord make_prototype(Klass* kls) {
+  markWord prototype = markWord::prototype();
+#ifdef _LP64
+  if (UseCompactObjectHeaders) {
+    // With compact object headers, the narrow Klass ID is part of the mark word.
+    // We therfore seed the mark word with the narrow Klass ID.
+    // Note that only those Klass that can be instantiated have a narrow Klass ID.
+    // For those who don't, we leave the klass bits empty and assert if someone
+    // tries to use those.
+    const narrowKlass nk = CompressedKlassPointers::is_encodable(kls) ?
+        CompressedKlassPointers::encode(const_cast<Klass*>(kls)) : 0;
+    prototype = prototype.set_narrow_klass(nk);
+  }
+#endif
+  return prototype;
 }
 
 // "Normal" instantiation is preceded by a MetaspaceObj allocation
@@ -196,6 +209,7 @@ void* Klass::operator new(size_t size, ClassLoaderData* loader_data, size_t word
 // The constructor is also used from CppVtableCloner,
 // which doesn't zero out the memory before calling the constructor.
 Klass::Klass(KlassKind kind) : _kind(kind),
+                           _prototype_header(make_prototype(this)),
                            _shared_class_path_index(-1) {
   CDS_ONLY(_shared_class_flags = 0;)
   CDS_JAVA_HEAP_ONLY(_archived_mirror_index = -1;)
@@ -740,6 +754,10 @@ void Klass::oop_print_on(oop obj, outputStream* st) {
      // print header
      obj->mark().print_on(st);
      st->cr();
+     if (UseCompactObjectHeaders) {
+       st->print(BULLET"prototype_header: " INTPTR_FORMAT, _prototype_header.value());
+       st->cr();
+     }
   }
 
   // print class
@@ -950,4 +968,10 @@ const char* Klass::class_in_module_of_loader(bool use_are, bool include_parent_l
                parent_loader_name_and_id);
 
   return class_description;
+}
+
+bool Klass::hash_requires_reallocation(oop obj) const {
+  assert(UseCompactObjectHeaders, "only with compact i-hash");
+  assert((size_t)hash_offset_in_bytes(obj) <= (obj->base_size_given_klass(this) * HeapWordSize), "hash offset must be eq or lt base size: hash offset: %d, base size: " SIZE_FORMAT, hash_offset_in_bytes(obj), obj->base_size_given_klass(this) * HeapWordSize);
+  return obj->base_size_given_klass(this) * HeapWordSize - hash_offset_in_bytes(obj) < (int)sizeof(uint32_t);
 }

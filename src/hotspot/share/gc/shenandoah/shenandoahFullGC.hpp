@@ -84,7 +84,9 @@ private:
   void phase5_epilog();
 
   void distribute_slices(ShenandoahHeapRegionSet** worker_slices);
+  void calculate_target_humongous_objects_impl();
   void calculate_target_humongous_objects();
+  void compact_humongous_objects_impl();
   void compact_humongous_objects();
 };
 

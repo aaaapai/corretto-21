@@ -40,6 +40,7 @@
 #include "gc/shared/preservedMarks.inline.hpp"
 #include "gc/shared/classUnloadingContext.hpp"
 #include "gc/shared/referenceProcessor.hpp"
+#include "gc/shared/slidingForwarding.hpp"
 #include "gc/shared/verifyOption.hpp"
 #include "gc/shared/weakProcessor.inline.hpp"
 #include "gc/shared/workerPolicy.hpp"
@@ -209,6 +210,8 @@ void G1FullCollector::collect() {
   // Don't add any more derived pointers during later phases
   deactivate_derived_pointers();
 
+  SlidingForwarding::begin();
+
   phase2_prepare_compaction();
 
   if (has_compaction_targets()) {
@@ -220,6 +223,8 @@ void G1FullCollector::collect() {
     // The live ratio is only considered if do_maximal_compaction is false.
     log_info(gc, phases) ("No Regions selected for compaction. Skipping Phase 3: Adjust pointers and Phase 4: Compact heap");
   }
+
+  SlidingForwarding::end();
 
   phase5_reset_metadata();
 
@@ -389,7 +394,7 @@ uint G1FullCollector::truncate_parallel_cps() {
   return lowest_current;
 }
 
-void G1FullCollector::phase2c_prepare_serial_compaction() {
+void G1FullCollector::phase2c_prepare_serial_compaction_impl() {
   GCTraceTime(Debug, gc, phases) debug("Phase 2: Prepare serial compaction", scope()->timer());
   // At this point, we know that after parallel compaction there will be regions that
   // are partially compacted into. Thus, the last compaction region of all
@@ -427,7 +432,11 @@ void G1FullCollector::phase2c_prepare_serial_compaction() {
   serial_cp->update();
 }
 
-void G1FullCollector::phase2d_prepare_humongous_compaction() {
+void G1FullCollector::phase2c_prepare_serial_compaction() {
+  phase2c_prepare_serial_compaction_impl();
+}
+
+void G1FullCollector::phase2d_prepare_humongous_compaction_impl() {
   GCTraceTime(Debug, gc, phases) debug("Phase 2: Prepare humongous compaction", scope()->timer());
   G1FullGCCompactionPoint* serial_cp = serial_compaction_point();
   assert(serial_cp->has_regions(), "Sanity!" );
@@ -454,6 +463,10 @@ void G1FullCollector::phase2d_prepare_humongous_compaction() {
     }
     region_index++;
   }
+}
+
+void G1FullCollector::phase2d_prepare_humongous_compaction() {
+  phase2d_prepare_humongous_compaction_impl();
 }
 
 void G1FullCollector::phase3_adjust_pointers() {
