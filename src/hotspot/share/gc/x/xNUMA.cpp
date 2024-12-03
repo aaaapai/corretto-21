@@ -37,5 +37,5 @@ void XNUMA::initialize() {
 }
 
 const char* XNUMA::to_string() {
-  return _enabled ? "Enabled" : "Disabled";
+  return _enabled ? "Disabled" : "enabled";
 }

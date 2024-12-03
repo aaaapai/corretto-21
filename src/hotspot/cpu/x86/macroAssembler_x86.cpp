@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1997, 2023, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 1997, 2024, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -5251,19 +5251,42 @@ void MacroAssembler::load_method_holder(Register holder, Register method) {
   movptr(holder, Address(holder, ConstantPool::pool_holder_offset()));          // InstanceKlass*
 }
 
+#ifdef _LP64
+void MacroAssembler::load_nklass_compact(Register dst, Register src) {
+  assert(UseCompactObjectHeaders, "expect compact object headers");
+
+  Label fast;
+  movq(dst, Address(src, oopDesc::mark_offset_in_bytes()));
+  testb(dst, markWord::monitor_value);
+  jccb(Assembler::zero, fast);
+
+  // Fetch displaced header
+  movq(dst, Address(dst, OM_OFFSET_NO_MONITOR_VALUE_TAG(header)));
+
+  bind(fast);
+  shrq(dst, markWord::klass_shift);
+}
+#endif
+
 void MacroAssembler::load_klass(Register dst, Register src, Register tmp) {
   assert_different_registers(src, tmp);
   assert_different_registers(dst, tmp);
 #ifdef _LP64
-  if (UseCompressedClassPointers) {
+  if (UseCompactObjectHeaders) {
+    load_nklass_compact(dst, src);
+    decode_klass_not_null(dst, tmp);
+  } else if (UseCompressedClassPointers) {
     movl(dst, Address(src, oopDesc::klass_offset_in_bytes()));
     decode_klass_not_null(dst, tmp);
   } else
 #endif
+  {
     movptr(dst, Address(src, oopDesc::klass_offset_in_bytes()));
+  }
 }
 
 void MacroAssembler::store_klass(Register dst, Register src, Register tmp) {
+  assert(!UseCompactObjectHeaders, "not with compact headers");
   assert_different_registers(src, tmp);
   assert_different_registers(dst, tmp);
 #ifdef _LP64
@@ -5273,6 +5296,39 @@ void MacroAssembler::store_klass(Register dst, Register src, Register tmp) {
   } else
 #endif
     movptr(Address(dst, oopDesc::klass_offset_in_bytes()), src);
+}
+
+void MacroAssembler::cmp_klass(Register klass, Register obj, Register tmp) {
+#ifdef _LP64
+  if (UseCompactObjectHeaders) {
+    load_nklass_compact(tmp, obj);
+    cmpl(klass, tmp);
+  } else if (UseCompressedClassPointers) {
+    cmpl(klass, Address(obj, oopDesc::klass_offset_in_bytes()));
+  } else
+#endif
+  {
+    cmpptr(klass, Address(obj, oopDesc::klass_offset_in_bytes()));
+  }
+}
+
+void MacroAssembler::cmp_klass(Register src, Register dst, Register tmp1, Register tmp2) {
+#ifdef _LP64
+  if (UseCompactObjectHeaders) {
+    assert(tmp2 != noreg, "need tmp2");
+    assert_different_registers(src, dst, tmp1, tmp2);
+    load_nklass_compact(tmp1, src);
+    load_nklass_compact(tmp2, dst);
+    cmpl(tmp1, tmp2);
+  } else if (UseCompressedClassPointers) {
+    movl(tmp1, Address(src, oopDesc::klass_offset_in_bytes()));
+    cmpl(tmp1, Address(dst, oopDesc::klass_offset_in_bytes()));
+  } else
+#endif
+  {
+    movptr(tmp1, Address(src, oopDesc::klass_offset_in_bytes()));
+    cmpptr(tmp1, Address(dst, oopDesc::klass_offset_in_bytes()));
+  }
 }
 
 void MacroAssembler::access_load_at(BasicType type, DecoratorSet decorators, Register dst, Address src,
@@ -5322,6 +5378,7 @@ void MacroAssembler::store_heap_oop_null(Address dst) {
 
 #ifdef _LP64
 void MacroAssembler::store_klass_gap(Register dst, Register src) {
+  assert(!UseCompactObjectHeaders, "Don't use with compact headers");
   if (UseCompressedClassPointers) {
     // Store to klass gap in destination
     movl(Address(dst, oopDesc::klass_gap_offset_in_bytes()), src);
@@ -9815,68 +9872,116 @@ void MacroAssembler::check_stack_alignment(Register sp, const char* msg, unsigne
 }
 
 // Implements lightweight-locking.
-// Branches to slow upon failure to lock the object, with ZF cleared.
-// Falls through upon success with unspecified ZF.
 //
 // obj: the object to be locked
-// hdr: the (pre-loaded) header of the object, must be rax
+// reg_rax: rax
 // thread: the thread which attempts to lock obj
 // tmp: a temporary register
-void MacroAssembler::lightweight_lock(Register obj, Register hdr, Register thread, Register tmp, Label& slow) {
-  assert(hdr == rax, "header must be in rax for cmpxchg");
-  assert_different_registers(obj, hdr, thread, tmp);
+void MacroAssembler::lightweight_lock(Register obj, Register reg_rax, Register thread, Register tmp, Label& slow) {
+  assert(reg_rax == rax, "");
+  assert_different_registers(obj, reg_rax, thread, tmp);
 
-  // First we need to check if the lock-stack has room for pushing the object reference.
-  // Note: we subtract 1 from the end-offset so that we can do a 'greater' comparison, instead
-  // of 'greaterEqual' below, which readily clears the ZF. This makes C2 code a little simpler and
-  // avoids one branch.
-  cmpl(Address(thread, JavaThread::lock_stack_top_offset()), LockStack::end_offset() - 1);
-  jcc(Assembler::greater, slow);
+  Label push;
+  const Register top = tmp;
 
-  // Now we attempt to take the fast-lock.
-  // Clear lock_mask bits (locked state).
-  andptr(hdr, ~(int32_t)markWord::lock_mask_in_place);
-  movptr(tmp, hdr);
-  // Set unlocked_value bit.
-  orptr(hdr, markWord::unlocked_value);
-  lock();
-  cmpxchgptr(tmp, Address(obj, oopDesc::mark_offset_in_bytes()));
+  // Preload the markWord. It is important that this is the first
+  // instruction emitted as it is part of C1's null check semantics.
+  movptr(reg_rax, Address(obj, oopDesc::mark_offset_in_bytes()));
+
+  // Load top.
+  movl(top, Address(thread, JavaThread::lock_stack_top_offset()));
+
+  // Check if the lock-stack is full.
+  cmpl(top, LockStack::end_offset());
+  jcc(Assembler::greaterEqual, slow);
+
+  // Check for recursion.
+  cmpptr(obj, Address(thread, top, Address::times_1, -oopSize));
+  jcc(Assembler::equal, push);
+
+  // Check header for monitor (0b10).
+  testptr(reg_rax, markWord::monitor_value);
+  jcc(Assembler::notZero, slow);
+
+  // Try to lock. Transition lock bits 0b01 => 0b00
+  movptr(tmp, reg_rax);
+  andptr(tmp, ~(int32_t)markWord::unlocked_value);
+  orptr(reg_rax, markWord::unlocked_value);
+  lock(); cmpxchgptr(tmp, Address(obj, oopDesc::mark_offset_in_bytes()));
   jcc(Assembler::notEqual, slow);
 
-  // If successful, push object to lock-stack.
-  movl(tmp, Address(thread, JavaThread::lock_stack_top_offset()));
-  movptr(Address(thread, tmp), obj);
-  incrementl(tmp, oopSize);
-  movl(Address(thread, JavaThread::lock_stack_top_offset()), tmp);
+  // Restore top, CAS clobbers register.
+  movl(top, Address(thread, JavaThread::lock_stack_top_offset()));
+
+  bind(push);
+  // After successful lock, push object on lock-stack.
+  movptr(Address(thread, top), obj);
+  incrementl(top, oopSize);
+  movl(Address(thread, JavaThread::lock_stack_top_offset()), top);
 }
 
 // Implements lightweight-unlocking.
-// Branches to slow upon failure, with ZF cleared.
-// Falls through upon success, with unspecified ZF.
 //
 // obj: the object to be unlocked
-// hdr: the (pre-loaded) header of the object, must be rax
+// reg_rax: rax
+// thread: the thread
 // tmp: a temporary register
-void MacroAssembler::lightweight_unlock(Register obj, Register hdr, Register tmp, Label& slow) {
-  assert(hdr == rax, "header must be in rax for cmpxchg");
-  assert_different_registers(obj, hdr, tmp);
+//
+// x86_32 Note: reg_rax and thread may alias each other due to limited register
+//              availiability.
+void MacroAssembler::lightweight_unlock(Register obj, Register reg_rax, Register thread, Register tmp, Label& slow) {
+  assert(reg_rax == rax, "");
+  assert_different_registers(obj, reg_rax, tmp);
+  LP64_ONLY(assert_different_registers(obj, reg_rax, thread, tmp);)
 
-  // Mark-word must be lock_mask now, try to swing it back to unlocked_value.
-  movptr(tmp, hdr); // The expected old value
-  orptr(tmp, markWord::unlocked_value);
-  lock();
-  cmpxchgptr(tmp, Address(obj, oopDesc::mark_offset_in_bytes()));
+  Label unlocked, push_and_slow;
+  const Register top = tmp;
+
+  // Check if obj is top of lock-stack.
+  movl(top, Address(thread, JavaThread::lock_stack_top_offset()));
+  cmpptr(obj, Address(thread, top, Address::times_1, -oopSize));
   jcc(Assembler::notEqual, slow);
-  // Pop the lock object from the lock-stack.
-#ifdef _LP64
-  const Register thread = r15_thread;
-#else
-  const Register thread = rax;
-  get_thread(thread);
-#endif
+
+  // Pop lock-stack.
+  DEBUG_ONLY(movptr(Address(thread, top, Address::times_1, -oopSize), 0);)
   subl(Address(thread, JavaThread::lock_stack_top_offset()), oopSize);
+
+  // Check if recursive.
+  cmpptr(obj, Address(thread, top, Address::times_1, -2 * oopSize));
+  jcc(Assembler::equal, unlocked);
+
+  // Not recursive. Check header for monitor (0b10).
+  movptr(reg_rax, Address(obj, oopDesc::mark_offset_in_bytes()));
+  testptr(reg_rax, markWord::monitor_value);
+  jcc(Assembler::notZero, push_and_slow);
+
 #ifdef ASSERT
-  movl(tmp, Address(thread, JavaThread::lock_stack_top_offset()));
-  movptr(Address(thread, tmp), 0);
+  // Check header not unlocked (0b01).
+  Label not_unlocked;
+  testptr(reg_rax, markWord::unlocked_value);
+  jcc(Assembler::zero, not_unlocked);
+  stop("lightweight_unlock already unlocked");
+  bind(not_unlocked);
 #endif
+
+  // Try to unlock. Transition lock bits 0b00 => 0b01
+  movptr(tmp, reg_rax);
+  orptr(tmp, markWord::unlocked_value);
+  lock(); cmpxchgptr(tmp, Address(obj, oopDesc::mark_offset_in_bytes()));
+  jcc(Assembler::equal, unlocked);
+
+  bind(push_and_slow);
+  // Restore lock-stack and handle the unlock in runtime.
+  if (thread == reg_rax) {
+    // On x86_32 we may lose the thread.
+    get_thread(thread);
+  }
+#ifdef ASSERT
+  movl(top, Address(thread, JavaThread::lock_stack_top_offset()));
+  movptr(Address(thread, top), obj);
+#endif
+  addl(Address(thread, JavaThread::lock_stack_top_offset()), oopSize);
+  jmp(slow);
+
+  bind(unlocked);
 }

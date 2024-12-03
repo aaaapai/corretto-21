@@ -37,5 +37,5 @@ void ZNUMA::initialize() {
 }
 
 const char* ZNUMA::to_string() {
-  return _enabled ? "Enabled" : "Disabled";
+  return _enabled ? "Disabled" : "enabled";
 }
