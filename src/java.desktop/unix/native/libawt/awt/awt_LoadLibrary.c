@@ -58,7 +58,7 @@ JNIEXPORT jboolean JNICALL AWTIsHeadless() {
     jclass graphicsEnvClass;
 
     if (env == NULL) {
-        env = (JNIEnv *)JNU_GetEnv(jvm, JNI_VERSION_1_2);
+        env = (JNIEnv *)JNU_GetEnv(jvm, JNI_VERSION_21);
         graphicsEnvClass = (*env)->FindClass(env,
                                              "java/awt/GraphicsEnvironment");
         if (graphicsEnvClass == NULL) {
@@ -107,12 +107,12 @@ AWT_OnLoad(JavaVM *vm, void *reserved)
     char *p, *tk;
     JNI_OnLoad_type *JNI_OnLoad_ptr;
     struct utsname name;
-    JNIEnv *env = (JNIEnv *)JNU_GetEnv(vm, JNI_VERSION_1_2);
+    JNIEnv *env = (JNIEnv *)JNU_GetEnv(vm, JNI_VERSION_21);
     void *v;
 
     if (awtHandle != NULL) {
         /* Avoid several loading attempts */
-        return JNI_VERSION_1_2;
+        return JNI_VERSION_21;
     }
 
     jvm = vm;
@@ -154,7 +154,7 @@ AWT_OnLoad(JavaVM *vm, void *reserved)
 
     awtHandle = dlopen(buf, RTLD_LAZY | RTLD_GLOBAL);
 #endif
-    return JNI_VERSION_1_2;
+    return JNI_VERSION_21;
 }
 
 JNIEXPORT jint JNICALL

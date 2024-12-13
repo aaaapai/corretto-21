@@ -45,12 +45,10 @@ XInitialize::XInitialize(XBarrierSet* barrier_set) {
 
   // Early initialization
   XAddress::initialize();
-  XNUMA::initialize();
   XCPU::initialize();
   XStatValue::initialize();
   XThreadLocalAllocBuffer::initialize();
   XTracer::initialize();
-  XLargePages::initialize();
   XHeuristics::set_medium_page_size();
   XBarrierSet::set_barrier_set(barrier_set);
 
